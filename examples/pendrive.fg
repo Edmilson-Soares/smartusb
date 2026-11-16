@@ -1,0 +1,205 @@
+// Exemplo — gestão de um pen drive (ou outro disco USB removível): acha a
+// unidade, mostra espaço e rótulo, lista, cria, lê, copia, move e apaga
+// arquivos e pastas, e ejeta com segurança. Os caminhos são relativos à raiz
+// do pen drive (ou absolutos dentro dele).
+//   fogu run examples/pendrive.fg                              info da unidade + raiz
+//   fogu run examples/pendrive.fg listar [pasta]
+//   fogu run examples/pendrive.fg criar notas/ola.txt "Olá, mundo"
+//   fogu run examples/pendrive.fg ler notas/ola.txt
+//   fogu run examples/pendrive.fg pasta fotos/2026
+//   fogu run examples/pendrive.fg copiar C:/Users/eu/doc.pdf docs/          (de/para o PC também)
+//   fogu run examples/pendrive.fg mover notas/ola.txt notas/velho.txt
+//   fogu run examples/pendrive.fg apagar notas/velho.txt   (pasta cheia: --tudo)
+//   fogu run examples/pendrive.fg ejetar
+// Opções: --unidade E: (sem ela usa o primeiro disco removível encontrado).
+import usb from "../smartusb.fg"
+import cli from "fogu:cli"
+import fs from "fogu:fs"
+import path from "fogu:path"
+import process from "fogu:process"
+import system from "fogu:system"
+import time from "fogu:time"
+
+const UNIDADE = { name: "unidade", long: "unidade", type: "str", default: "", help: "letra da unidade, ex. D: (padrão: o primeiro disco removível)" }
+
+const SPEC = {
+    name: "pendrive",
+    about: "Gestão de um pen drive USB: listar, criar, ler, copiar, mover, apagar e ejetar.",
+    commands: [
+        { name: "info", about: "unidade, rótulo, espaço e o aparelho USB", args: [UNIDADE] },
+        { name: "listar", about: "lista uma pasta (padrão: a raiz)", args: [{ name: "pasta", positional: true }, UNIDADE] },
+        { name: "criar", about: "cria/sobrescreve um arquivo de texto", args: [{ name: "arquivo", positional: true, required: true }, { name: "texto", positional: true }, UNIDADE] },
+        { name: "ler", about: "mostra um arquivo de texto", args: [{ name: "arquivo", positional: true, required: true }, UNIDADE] },
+        { name: "pasta", about: "cria uma pasta (e as pastas acima)", args: [{ name: "nome", positional: true, required: true }, UNIDADE] },
+        { name: "copiar", about: "copia arquivo ou pasta (origem/destino podem ser do PC)", args: [{ name: "origem", positional: true, required: true }, { name: "destino", positional: true, required: true }, UNIDADE] },
+        { name: "mover", about: "move/renomeia dentro do pen drive", args: [{ name: "origem", positional: true, required: true }, { name: "destino", positional: true, required: true }, UNIDADE] },
+        { name: "apagar", about: "apaga arquivo ou pasta vazia (--tudo: pasta com conteúdo)", args: [{ name: "caminho", positional: true, required: true }, { name: "tudo", long: "tudo", type: "bool" }, UNIDADE] },
+        { name: "ejetar", about: "remove o pen drive com segurança", args: [UNIDADE] },
+    ],
+}
+
+// ---- unidades removíveis (Windows: fsutil/vol; Linux/macOS: /media, /Volumes) ----
+
+fn _cmd(prog, args) {
+    const [r, err] = process.run(prog, args)
+    if err != nil || !r.ok { return "" }
+    return r.stdout
+}
+
+// Letras das unidades removíveis presentes (Windows).
+fn unidadesRemoviveis() {
+    const out = []
+    for c in "DEFGHIJKLMNOPQRSTUVWXYZ".chars() {
+        const t = _cmd("fsutil", ["fsinfo", "drivetype", `${c}:`])
+        if t.contains("Removable") || t.contains("Removível") { out.push(`${c}:`) }
+    }
+    return out
+}
+
+// { letra, raiz, rotulo, total, livre } de uma unidade.
+fn infoUnidade(letra) {
+    const info = { letra: letra, raiz: `${letra}/`, rotulo: "", total: 0, livre: 0 }
+    const vol = _cmd("cmd", ["/C", `vol ${letra}`])
+    for linha in vol.split("\n") {
+        const l = linha.trim()
+        if l.contains(" is ") && !l.contains("Serial") { info.rotulo = l.split(" is ")[1].trim() }
+        if l.contains(" é ") && !l.contains("Série") { info.rotulo = l.split(" é ")[1].trim() }
+    }
+    const df = _cmd("fsutil", ["volume", "diskfree", letra])
+    for linha in df.split("\n") {
+        const l = linha.trim().lower()
+        if !l.contains(":") { continue }
+        const valor = l.split(":")[1].trim().split(" ")[0].replace(".", "").replace(",", "")
+        const digitos = []
+        for ch in valor.chars() { if "0123456789".contains(ch) { digitos.push(ch) } }
+        if len(digitos) == 0 { continue }
+        const n = int(digitos.join(""))
+        if l.starts_with("total free bytes") || l.starts_with("total de bytes livres") { info.livre = n }
+        else if l.starts_with("total bytes") || l.starts_with("total de bytes") { info.total = n }
+    }
+    return info
+}
+
+fn gb(n) { return `${int(n / 10737418.24) / 100.0} GB` }
+
+// Caminho dentro do pen drive: relativo à raiz, ou absoluto se já estiver nela.
+fn dentro(raiz, p) {
+    const s = p.replace("\\", "/")
+    if s.lower().starts_with(raiz.lower()) { return s }
+    if s.len() >= 2 && s.slice(1, 2) == ":" { return s }           // outra unidade (origem de cópia)
+    if s.starts_with("/") { return raiz + s.slice(1) }
+    return raiz + s
+}
+
+fn soNoPendrive(raiz, p) {
+    if !p.lower().starts_with(raiz.lower()) { return nil, error(`${p} está fora do pen drive (${raiz})`) }
+    return true, nil
+}
+
+// Cópia recursiva (fs.copy copia um arquivo).
+fn copiar(origem, destino) {
+    if fs.isDir(origem) {
+        fs.mkdir(destino)?
+        for nome in fs.list(origem)? { copiar(path.join(origem, nome), path.join(destino, nome))? }
+        return true, nil
+    }
+    let alvo = destino
+    if fs.isDir(destino) || destino.ends_with("/") {
+        fs.mkdir(destino)?
+        alvo = path.join(destino, path.basename(origem))
+    }
+    fs.copy(origem, alvo)?
+    return true, nil
+}
+
+fn listar(pasta) {
+    const linhas = []
+    for nome in fs.list(pasta)? {
+        const p = path.join(pasta, nome)
+        const [st, err] = fs.stat(p)
+        if err != nil { continue }
+        if st.isDir { linhas.push([nome + "/", "<pasta>", ""]) } else { linhas.push([nome, str(st.size), time.format(st.modified, "%Y-%m-%d %H:%M")]) }
+    }
+    if len(linhas) == 0 { print("  (vazia)") } else { print(cli.table(linhas, { headers: ["nome", "bytes", "modificado"], style: "rounded" })) }
+    return true, nil
+}
+
+fn main() {
+    const opts = cli.parse(SPEC, system.args)
+    const cmd = opts.command ?? "info"
+    const args = opts.get("args", {})
+
+    // 1. a unidade
+    let letra = args.get("unidade", "").upper().replace("/", "").replace("\\", "")
+    if letra != "" && !letra.ends_with(":") { letra = letra + ":" }
+    if letra == "" {
+        const lista = unidadesRemoviveis()
+        if len(lista) == 0 { return nil, error("nenhum disco removível encontrado; conecte o pen drive ou passe --unidade X:") }
+        letra = lista[0]
+        if len(lista) > 1 { print(`removíveis: ${lista.join(", ")} (usando ${letra}; escolha com --unidade)`) }
+    }
+    const u = infoUnidade(letra)
+    if !fs.isDir(u.raiz) { return nil, error(`a unidade ${letra} não está acessível`) }
+
+    if cmd == "info" {
+        print(`unidade ${u.letra} "${u.rotulo}": ${gb(u.livre)} livres de ${gb(u.total)}`)
+        for d in usb.devices("storage")? { print(`  aparelho USB: ${d.name} (${d.vid}:${d.pid}, ${d.id})`) }
+        print("raiz:")
+        listar(u.raiz)?
+    } else if cmd == "listar" {
+        const pasta = dentro(u.raiz, args.get("pasta") ?? "")
+        print(`${pasta}:`)
+        listar(pasta)?
+    } else if cmd == "criar" {
+        const alvo = dentro(u.raiz, args.arquivo)
+        soNoPendrive(u.raiz, alvo)?
+        fs.mkdir(path.dirname(alvo))?
+        fs.writeText(alvo, args.get("texto") ?? "")?
+        print(`criado ${alvo} (${(fs.stat(alvo)?).size} bytes)`)
+    } else if cmd == "ler" {
+        const alvo = dentro(u.raiz, args.arquivo)
+        print(fs.readText(alvo)?)
+    } else if cmd == "pasta" {
+        const alvo = dentro(u.raiz, args.nome)
+        soNoPendrive(u.raiz, alvo)?
+        fs.mkdir(alvo)?
+        print(`pasta ${alvo} pronta`)
+    } else if cmd == "copiar" {
+        const origem = dentro(u.raiz, args.origem)
+        const destino = dentro(u.raiz, args.destino)
+        if !fs.exists(origem) { return nil, error(`${origem} não existe`) }
+        copiar(origem, destino)?
+        print(`copiado ${origem} -> ${destino}`)
+    } else if cmd == "mover" {
+        const origem = dentro(u.raiz, args.origem)
+        const destino = dentro(u.raiz, args.destino)
+        soNoPendrive(u.raiz, origem)?
+        soNoPendrive(u.raiz, destino)?
+        fs.mkdir(path.dirname(destino))?
+        fs.move(origem, destino)?
+        print(`movido ${origem} -> ${destino}`)
+    } else if cmd == "apagar" {
+        const alvo = dentro(u.raiz, args.caminho)
+        soNoPendrive(u.raiz, alvo)?
+        if alvo.lower() == u.raiz.lower() { return nil, error("não apago a raiz do pen drive") }
+        if fs.isDir(alvo) && len(fs.list(alvo)?) > 0 {
+            if !args.get("tudo", false) { return nil, error(`${alvo} tem conteúdo; passe --tudo para apagar tudo`) }
+            fs.removeAll(alvo)?
+        } else {
+            fs.remove(alvo)?
+        }
+        print(`apagado ${alvo}`)
+    } else if cmd == "ejetar" {
+        const script = `(New-Object -ComObject Shell.Application).Namespace(17).ParseName("${u.letra}").InvokeVerb("Eject")`
+        const r = process.run("powershell", ["-NoProfile", "-Command", script])?
+        if !r.ok { return nil, error(`não consegui ejetar: ${r.stderr.trim()}`) }
+        print(`${u.letra} ejetado; pode retirar o pen drive`)
+    }
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil {
+    print(`erro: ${err.message}`)
+    system.exit(1)
+}

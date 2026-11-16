@@ -1,0 +1,177 @@
+// Testes do smartusb.fg. Precisam da lib nativa (fogu run build:native).
+// Nenhum precisa de scanner conectado.
+//   fogu test
+import { test, skip, expect } from "fogu:test"
+import usb from "./smartusb.fg"
+import fs from "fogu:fs"
+import time from "fogu:time"
+
+test("carrega a lib nativa", (): error => {
+    expect(usb.version()?).toBe("0.1.0")
+    return nil
+})
+
+test("analisa o conteúdo lido", (): error => {
+    const e = usb.analyze("]E07891000315507")?
+    expect(e.text).toBe("7891000315507")
+    expect(e.symbology).toBe("ean_upc")
+    expect(e.content.type).toBe("ean13")
+    expect(e.content.valid).toBe(true)
+    expect((usb.analyze("]Q1https://fogu.dev")?).content.type).toBe("url")
+    expect((usb.analyze("529.982.247-25")?).content.type).toBe("cpf")
+    expect((usb.analyze("WIFI:S:Casa;T:WPA;P:segredo;;")?).content.password).toBe("segredo")
+    expect((usb.analyze("00193373700000001000500940144816060680935031")?).content.type).toBe("boleto")
+    expect((usb.analyze("qualquer coisa")?).content.type).toBe("text")
+    return nil
+})
+
+test("reconhece aparelhos descritos à mão", (): error => {
+    // HID POS (usage page 0x8C = 140)
+    const a = usb.identify({ vid: "1234", pid: "0001", hid: [{ usage_page: 140, usage: 2 }] })?
+    expect(a.kind).toBe("barcode_scanner")
+    expect(a.modes).toEqual(["hidpos"])
+    // Honeywell em modo teclado
+    const b = usb.identify({ vid: "0c2e", pid: "0b61", hid: [{ usage_page: 1, usage: 6 }] })?
+    expect(b.kind).toBe("barcode_scanner")
+    expect(b.modes).toEqual(["keyboard"])
+    // Leitor de smart card (classe 0x0B)
+    expect((usb.identify({ vid: "058f", pid: "9540", interfaces: [{ class: 11 }] })?).kind).toBe("smartcard_reader")
+    expect((usb.identify({ vid: "072f", pid: "2200" })?).kind).toBe("nfc_reader")
+    expect((usb.identify({ vid: "0529", pid: "0620", interfaces: [{ class: 11 }] })?).kind).toBe("security_token")
+    expect((usb.identify({ vid: "9999", pid: "1", interfaces: [{ class: 8, subclass: 6, protocol: 80 }] })?).kind).toBe("storage")
+    const [_r, err] = usb.identify({ pid: "1" })
+    expect(err.message).toContain("vid")
+    return nil
+})
+
+test("base própria em JSON", (): error => {
+    usb.clearIds()?
+    expect(usb.loadIds("devices.json")?).toBe(3)
+    const s = usb.identify({ vid: "1a86", pid: "7523", ports: ["COM9"] })?
+    expect(s.kind).toBe("scale")
+    expect(s.source).toBe("user")
+    expect(s.name).toContain("Balança")
+    usb.clearIds()?
+    expect(usb.idsSize()?).toBe(0)
+    return nil
+})
+
+let withIds = skip
+if fs.exists("data/usb.ids") { withIds = test }
+
+withIds("usb.ids (fogu run usbids)", (): error => {
+    expect(usb.loadIds("data/usb.ids")? > 10000).toBe(true)
+    const f = usb.identify({ vid: "0403", pid: "6001" })?
+    expect(f.product).toContain("FT232")
+    usb.clearIds()?
+    return nil
+})
+
+test("lista os aparelhos conectados", (): error => {
+    const list = usb.devices()?
+    expect(typeof(list)).toBe("list")
+    for d in list {
+        expect(len(d.vid)).toBe(4)
+        expect(len(d.kind) > 0).toBe(true)
+    }
+    expect(typeof(usb.scanners()?)).toBe("list")
+    return nil
+})
+
+test("observa conexões", (): error => {
+    const list = usb.devices()?
+    const w = usb.watch()?
+    // Primeira espera: os presentes vêm como "added".
+    const first = w.wait(100ms)?
+    expect(len(first)).toBe(len(list))
+    expect(w.wait(100ms)?).toEqual([])
+    w.close()?
+    return nil
+})
+
+test("erros de scanner", (): error => {
+    const [_s, err] = usb.openScanner("COM250")
+    expect(err.message).toContain("COM250")
+    const [_t, err2] = usb.openScanner("", { mode: "nada" })
+    expect(err2.message).toContain("mode")
+    return nil
+})
+
+// Modo teclado sem ninguém digitando: a leitura termina pelo tempo (nil).
+let onKeyboard = skip
+const [_probe, probeErr] = usb.openScanner("keyboard")
+if probeErr == nil {
+    _probe.close()
+    onKeyboard = test
+}
+
+onKeyboard("scanner em modo teclado espera e devolve nil", (): error => {
+    const s = usb.openScanner("keyboard", { layout: "abnt2" })?
+    expect(s.mode).toBe("keyboard")
+    expect(s.read(150ms)?).toBe(nil)
+    s.close()?
+    return nil
+})
+
+test("ESC/POS e páginas de código", (): error => {
+    expect((usb.encode("Ação", "cp860")?).hex()).toBe("4187846f")
+    const r = usb.receipt("cp860")
+    r.center().bold().line("Olá").cut()
+    expect((r.bytes()?).hex()).toBe("1b401b74031b61011b45014f6ca00a1d564103")
+    const [_b, err] = usb.escpos([{ nada: 1 }])
+    expect(err.message).toContain("unknown command")
+    return nil
+})
+
+test("impressoras instaladas e erros", (): error => {
+    const p = usb.printers()?
+    expect(typeof(p.system)).toBe("list")
+    const [_p, err] = usb.openPrinter("printer:__nao_existe__")
+    expect(err != nil).toBe(true)
+    return nil
+})
+
+test("biometria não falha sem leitor", (): error => {
+    const [list, err] = usb.fingerprintReaders()
+    if err == nil { expect(typeof(list)).toBe("list") }
+    return nil
+})
+
+test("modo exclusivo exige um scanner específico", (): error => {
+    const [_s, err] = usb.openScanner("keyboard", { exclusive: true })
+    expect(err.message).toContain("exclusive")
+    return nil
+})
+
+test("hex aceita str, buffer e lista", (): error => {
+    expect(usb.hex([2, 255])).toBe("02ff")
+    expect(usb.fromHex("0aff").toList()).toEqual([10, 255])
+    return nil
+})
+
+test("espera em fatias: outras tarefas fg rodam durante a espera", (): error => {
+    const w = usb.watch()?
+    let ticks = 0
+    fg fn() {
+        for i in 0..5 {
+            ticks += 1
+            time.delay(10ms)
+        }
+    }()
+    const t0 = time.monotonic()
+    w.wait(0)?
+    const evs = w.wait(200ms)?
+    const during = ticks
+    expect(typeof(evs)).toBe("list")
+    expect(time.monotonic() - t0).toBeGreaterThan(0.15)
+    expect(during).toBe(5)
+    w.close()?
+    return nil
+})
+
+test("nativeInfo mostra a plataforma e o binário carregado", () => {
+    const i = usb.nativeInfo()
+    expect(i.loaded).toBe(true)
+    expect(i.platform).toContain(i.os)
+    expect(i.path).toContain(i.file)
+})

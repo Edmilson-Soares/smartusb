@@ -1,0 +1,172 @@
+// Testes do wcopy.fg sem leitor: moldura dos relatórios, checksums, layout
+// MIFARE e um leitor simulado (respostas capturadas do aparelho real).
+//   fogu test
+import { test, skip, expect } from "fogu:test"
+import wcopy from "./wcopy.fg"
+
+// Resposta real do leitor ao GetFirmwareVersion: PN532, firmware 1.6.
+const FW_REPLY = "020e0200d50332010607900045fd00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+test("frame: moldura host->leitor com LEN, seq, PNLEN, checksum e FE", (): error => {
+    const f = wcopy.frame([0xD4, 0x4A, 0x01, 0x00], 1)
+    expect(len(f)).toBe(64)
+    // 01 LEN=0f seq=01 00 FF 00 00 00 PNLEN=04 D4 4A 01 00 CK=cc FE
+    expect(bytes(f.slice(0, 15)).hex()).toBe("010f0100ff00000004d44a0100ccfe")
+    let sum = 0
+    for i in 1..14 { sum += f[i] }
+    expect(sum % 256).toBe(0xFE)
+    expect(wcopy.frame([0xD4, 0x02], 258).slice(2, 4)).toEqual([2, 1])   // little-endian
+    return nil
+})
+
+test("parse: aceita a resposta real e recusa lixo", (): error => {
+    const body = wcopy.parse(bytes(FW_REPLY, "hex"))
+    expect(bytes(body).hex()).toBe("d503320106079000")       // o firmware acrescenta "90 00"
+    expect(wcopy.parse([1, 2, 3])).toBe(nil)                                  // curto / marcador errado
+    const bad = bytes(FW_REPLY, "hex").toList()
+    bad[9] = 0x33                                                             // um byte alterado: checksum falha
+    expect(wcopy.parse(bad)).toBe(nil)
+    const noterm = bytes(FW_REPLY, "hex").toList()
+    noterm[13] = 0xFE
+    expect(wcopy.parse(noterm)).toBe(nil)
+    return nil
+})
+
+test("layout MIFARE Classic: setores, trailers e tipos pelo SAK", (): error => {
+    expect(wcopy.sectorOf(4)).toBe(1)
+    expect(wcopy.sectorOf(127)).toBe(31)
+    expect(wcopy.sectorOf(128)).toBe(32)
+    expect(wcopy.sectorOf(255)).toBe(39)
+    expect(wcopy.isTrailer(3)).toBe(true)
+    expect(wcopy.isTrailer(4)).toBe(false)
+    expect(wcopy.isTrailer(143)).toBe(true)
+    expect(wcopy.isTrailer(131)).toBe(false)
+    const [k1, f1] = wcopy.kindOf(0x08)
+    expect(k1).toBe("mifare_classic_1k")
+    expect(f1).toBe("mifare_classic")
+    expect(wcopy.kindOf(0x00)[0]).toBe("mifare_ultralight")
+    expect(wcopy.kindOf(0x18)[0]).toBe("mifare_classic_4k")
+    expect(wcopy.kindOf(0x20)[1]).toBe("iso14443_4")
+    return nil
+})
+
+test("trailer: bits de acesso válidos e inválidos", (): error => {
+    expect(wcopy.accessBitsValid(bytes("FFFFFFFFFFFFFF078069FFFFFFFFFFFF", "hex"))).toBe(true)   // fábrica
+    expect(wcopy.accessBitsValid(bytes("D3F7D3F7D3F77F078840FFFFFFFFFFFF", "hex"))).toBe(true)   // wCopy / NDEF
+    expect(wcopy.accessBitsValid(bytes("00000000000000000000000000000000", "hex"))).toBe(false)
+    expect(wcopy.accessBitsValid([1, 2, 3])).toBe(false)
+    return nil
+})
+
+// HID simulado: responde ao GetFirmwareVersion, ao InListPassiveTarget (um
+// MIFARE Classic 1K, UID 49 0F DD 56) e a InDataExchange (auth só com a
+// chave de fábrica; READ devolve o número do bloco repetido).
+struct FakeHid {
+    queue = []
+    sent = []
+    auths = 0
+
+    new() {
+        this.queue = []
+        this.sent = []
+    }
+
+    _reply(body) {
+        // 02 LEN seq(2) corpo CK FD, checksum fechando em FD
+        const out = [2, 0, 0, 0]
+        for b in body { out.push(b) }
+        out[1] = len(out) + 2
+        let sum = 0
+        for i in 1..len(out) { sum += out[i] }
+        out.push((0xFD - sum % 256 + 256) % 256)
+        out.push(0xFD)
+        while len(out) < 64 { out.push(0) }
+        this.queue.push(bytes(out))
+    }
+
+    write(data) {
+        const d = data.slice(1)              // tira o número do relatório
+        this.sent.push(d)
+        const n = d[8]
+        const body = d.slice(9, 9 + n)
+        const cmd = body[1]
+        if cmd == 0x02 { this._reply([0xD5, 0x03, 0x32, 1, 6, 7]) }
+        if cmd == 0x4A { this._reply([0xD5, 0x4B, 1, 1, 0, 4, 0x08, 4, 0x49, 0x0F, 0xDD, 0x56]) }
+        if cmd == 0x40 {
+            const tag = body[3]
+            if tag == 0x60 || tag == 0x61 {
+                this.auths += 1
+                const key = bytes(body.slice(5, 11)).hex()
+                if key == "ffffffffffff" { this._reply([0xD5, 0x41, 0]) } else { this._reply([0xD5, 0x41, 0x14]) }
+            } else if tag == 0x30 {
+                const block = body[4]
+                const data = []
+                for i in 0..16 { data.push(block) }
+                this._reply([0xD5, 0x41, 0].concat(data))
+            } else if tag == 0xA0 || tag == 0xA2 {
+                this._reply([0xD5, 0x41, 0])
+            }
+        }
+        return len(data), nil
+    }
+
+    read(_timeout = 0) {
+        if len(this.queue) == 0 { return nil, nil }
+        return this.queue.shift(), nil
+    }
+
+    close() { return true, nil }
+}
+
+test("leitor simulado: firmware, poll, dicionário de chaves e leitura", (): error => {
+    const hid = new FakeHid()
+    const r = wcopy.fromHid(hid)
+    const fw = r.firmware()?
+    expect(fw.ic).toBe(0x32)
+    expect(fw.version).toBe("1.6")
+
+    const card = r.poll(1000)?
+    expect(card.uidHex).toBe("490FDD56")
+    expect(card.kind).toBe("mifare_classic_1k")
+    expect(card.family).toBe("mifare_classic")
+    expect(card.uid()?).toBe("490FDD56")
+
+    // key "" tenta KNOWN_KEYS: a 1a (wCopy) falha, a 2a (fábrica) abre.
+    const key = card.auth(4)?
+    expect(key).toBe("FFFFFFFFFFFF")
+    expect(hid.auths).toBe(2)
+
+    const b = card.readBlock(5)?                 // mesmo setor: não autentica de novo
+    expect(b.hex()).toBe("05050505050505050505050505050505")
+    expect(hid.auths).toBe(2)
+    card.readBlock(8)?                           // outro setor: nova autenticação
+    expect(hid.auths > 2).toBe(true)
+
+    const [_w, werr] = card.writeBlock(7, bytes("00000000000000000000000000000000", "hex"))
+    expect(werr.message).toContain("trailer")
+    const [_z, zerr] = card.writeBlock(0, bytes("00000000000000000000000000000000", "hex"))
+    expect(zerr.message).toContain("bloco 0")
+    expect(card.writeBlock(4, bytes("46500000000000000000000000000000", "hex"))?).toBe(true)
+
+    // chave explícita errada: só ela é tentada
+    const [_a, aerr] = card.auth(4, "A0A1A2A3A4A5")
+    expect(aerr.message).toContain("1 chave")
+    return nil
+})
+
+// Com o leitor de verdade conectado, confere a conversa toda.
+fn _hasReader() {
+    const [d, err] = wcopy.find()
+    return err == nil && d != nil
+}
+let withReader = skip
+if _hasReader() { withReader = test }
+
+withReader("leitor wCopy real: firmware e procura de cartão", (): error => {
+    const r = wcopy.open()?
+    expect(r.fw.ic).toBe(0x32)
+    const card = r.poll(500)?
+    if card != nil { print(`    cartão: ${card.name()} UID ${card.uidHex}`) } else { print("    sem cartão no leitor") }
+    r.close()?
+    return nil
+})

@@ -1,0 +1,142 @@
+// Exemplo — ler e gravar informação pessoal num cartão com o leitor NFC
+// "wCopy Smart Reader" (NSCCN, 0416:b030), que não tem PC/SC: a conversa é
+// pelo HID (wcopy.fg). O registro (nome, nascimento, documento, telefone,
+// e-mail) usa o mesmo formato do smartcard/examples/registro.fg, então um
+// cartão gravado aqui é lido pelo ACR122U (smartcard/examples/pessoa.fg) e
+// vice-versa.
+//   fogu run examples/cartao.fg                       (info do cartão + registro, se houver)
+//   fogu run examples/cartao.fg ler
+//   fogu run examples/cartao.fg gravar                (pergunta os campos)
+//   fogu run examples/cartao.fg gravar "Ana Silva" 1990-05-12 12345678 912345678 ana@exemplo.pt
+//   fogu run examples/cartao.fg apagar
+//   fogu run examples/cartao.fg dump                  (setores/páginas em hex)
+// Opções (depois do comando): --chave A0A1A2A3A4A5 (só essa chave A no
+// Classic; sem ela tenta as chaves conhecidas), --bytes 144 (área de uma
+// NTAG sem capability container).
+import wcopy from "../wcopy.fg"
+import registro from "../../smartcard/examples/registro.fg"
+import cli from "fogu:cli"
+import system from "fogu:system"
+
+const OPCOES = [
+    { name: "chave", long: "chave", type: "str", default: "", help: "chave A do MIFARE Classic, em hex (padrão: tenta as conhecidas)" },
+    { name: "bytes", long: "bytes", type: "int", default: 0, help: "área de usuário do Ultralight/NTAG sem capability container (padrão 48)" },
+]
+
+const SPEC = {
+    name: "cartao",
+    about: "Lê, grava e apaga um registro pessoal num cartão MIFARE pelo leitor wCopy Smart Reader.",
+    commands: [
+        { name: "ler", about: "mostra o registro do cartão", args: OPCOES },
+        {
+            name: "gravar",
+            about: "grava um registro (sem campos, pergunta no terminal)",
+            args: [{ name: "campos", positional: true, multiple: true, help: "nome nascimento documento telefone email" }].concat(OPCOES),
+        },
+        { name: "apagar", about: "zera a área do registro", args: OPCOES },
+        { name: "dump", about: "mostra o cartão inteiro em hex", args: OPCOES },
+    ],
+}
+
+fn mostrar(reg) {
+    const linhas = []
+    for c in registro.CAMPOS { linhas.push([registro.ROTULOS[c], reg.get(c, "")]) }
+    print(cli.table(linhas, { style: "rounded" }))
+}
+
+fn perguntar() {
+    const reg = {}
+    for c in registro.CAMPOS {
+        reg[c] = (cli.input(registro.ROTULOS[c], { allowEmpty: true })?).trim()
+    }
+    return reg, nil
+}
+
+fn dump(card, chave) {
+    for s in card.dump(chave)? {
+        if s.has("pages") {
+            const p = s.pages.toList()
+            for i in 0..int(len(p) / 4) { print(`  página ${i}: ${bytes(p.slice(i * 4, i * 4 + 4)).hex()}`) }
+        } else if s.has("error") {
+            print(`  setor ${s.sector}: ${s.error}`)
+        } else {
+            print(`  setor ${s.sector} (chave ${s.key}):`)
+            for i, b in s.blocks { print(`    bloco ${s.sector * 4 + i}: ${b.hex()}`) }
+        }
+    }
+    return true, nil
+}
+
+fn main() {
+    const opts = cli.parse(SPEC, system.args)
+    const cmd = opts.command ?? "ler"
+    const args = opts.get("args", {})
+    const chave = args.get("chave", "")
+
+    const dev = wcopy.find()?
+    if dev == nil { return nil, error("nenhum wCopy Smart Reader (0416:b030) na USB; conecte um e rode de novo") }
+    print(`leitor: ${dev.name} (${dev.id})`)
+    const r = wcopy.open(dev.id)?
+    print(`  chip PN532, firmware ${r.fw.version}`)
+
+    print("aproxime o cartão do leitor (30s)...")
+    const card = r.poll(30s)?
+    if card == nil { return nil, error("nenhum cartão em 30s") }
+    print(`cartão: ${card.name()} (${card.kind}), UID ${card.uidHex}`)
+
+    if cmd == "dump" {
+        dump(card, chave)?
+        r.close()?
+        return true, nil
+    }
+
+    const area = registro.abrir(card, { key: chave, bytes: args.get("bytes", 0) })?
+    print(`  área do registro: ${area.capacidade()} bytes em ${len(area.slots)} ${area.unidade()} (a partir de ${area.slots[0]})`)
+
+    if cmd == "ler" {
+        const [reg, lerr] = area.ler()
+        if lerr != nil && lerr.message.contains("não tem um registro") {
+            print("o cartão está vazio: ainda não tem um registro pessoal.")
+            print("grave um com:")
+            print("  fogu run examples/cartao.fg gravar                 (pergunta os campos)")
+            print(`  fogu run examples/cartao.fg gravar "Ana Silva" 1990-05-12 12345678 912345678 ana@exemplo.pt`)
+        } else if lerr != nil {
+            return nil, lerr
+        } else {
+            print("registro no cartão:")
+            mostrar(reg)
+        }
+    } else if cmd == "gravar" {
+        const campos = args.get("campos", [])
+        let reg = {}
+        if len(campos) > 0 {
+            for i, c in registro.CAMPOS {
+                if i < len(campos) { reg[c] = campos[i] } else { reg[c] = "" }
+            }
+        } else {
+            reg = perguntar()?
+        }
+        const usados = area.gravar(reg)?
+        print(`gravado em ${usados} ${area.unidade()}; lendo de volta para conferir...`)
+        const lido = area.ler()?
+        for c in registro.CAMPOS {
+            if lido[c] != reg[c].trim() {
+                return nil, error(`campo ${c} lido diferente do gravado: '${lido[c]}' != '${reg[c]}'`)
+            }
+        }
+        print("conferido:")
+        mostrar(lido)
+    } else {
+        const usados = area.apagar()?
+        print(`registro apagado (${usados} ${area.unidade()} zerados)`)
+    }
+
+    r.close()?
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil {
+    print(`erro: ${err.message}`)
+    system.exit(1)
+}

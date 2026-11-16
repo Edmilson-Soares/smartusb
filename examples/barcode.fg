@@ -1,0 +1,137 @@
+// Exemplo — leitor de código de barras / QR Code pela USB: reconhece o
+// leitor (ou aprende qual "teclado USB" é o leitor), lê códigos e mostra o
+// conteúdo analisado (EAN, PIX, NF-e, boleto, URL, Wi-Fi, vCard...).
+//   fogu run examples/barcode.fg                    lê até ficar 60s sem leitura
+//   fogu run examples/barcode.fg --exclusivo        (Windows) as teclas do leitor não vão para a janela em foco
+//   fogu run examples/barcode.fg --layout abnt2     o leitor emula teclado ABNT2
+//   fogu run examples/barcode.fg --csv leituras.csv guarda cada leitura numa linha
+//   fogu run examples/barcode.fg --aprender         escuta todos os teclados, descobre qual é o
+//                                                   leitor e grava o VID/PID em devices.json
+// Leitores baratos se apresentam como "USB Keyboard", sem nada que os
+// distinga de um teclado. Na primeira vez, sem leitor reconhecido, o exemplo
+// pede uma leitura para descobrir qual teclado é o leitor e guarda o VID/PID
+// em devices.json; das próximas vezes ele já é reconhecido.
+import usb from "../smartusb.fg"
+import cli from "fogu:cli"
+import fs from "fogu:fs"
+import json from "fogu:json"
+import system from "fogu:system"
+
+const BASE = "devices.json"
+
+const SPEC = {
+    name: "barcode",
+    about: "Lê códigos de barras / QR Code de um leitor USB e mostra o conteúdo analisado.",
+    args: [
+        { name: "exclusivo", long: "exclusivo", type: "bool", help: "modo teclado exclusivo (Windows): as teclas do leitor não chegam à janela em foco" },
+        { name: "layout", long: "layout", type: "str", default: "us", choices: ["us", "abnt2"], help: "layout de teclado que o leitor emula" },
+        { name: "csv", long: "csv", type: "str", default: "", help: "arquivo CSV onde guardar as leituras (acrescenta no fim)" },
+        { name: "aprender", long: "aprender", type: "bool", help: "descobre qual teclado é o leitor e grava o VID/PID em devices.json" },
+        { name: "leitor", long: "leitor", type: "str", default: "", help: "id (1400-9.1), vvvv:pppp, porta COM ou 'keyboard' (qualquer teclado)" },
+        { name: "espera", long: "espera", type: "int", default: 60, help: "segundos sem leitura até encerrar (0 = até Ctrl+C)" },
+    ],
+}
+
+// Grava o VID/PID descoberto na base própria (devices.json), sem duplicar.
+fn aprender(dev) {
+    let lista = []
+    if fs.exists(BASE) { lista = json.parse(fs.readText(BASE)?)? }
+    const resto = []
+    for e in lista { if !(e.get("vid") == dev.vid && e.get("pid") == dev.pid) { resto.push(e) } }
+    resto.push({ vid: dev.vid, pid: dev.pid, name: `Leitor de código de barras (${dev.name})`, kind: "barcode_scanner" })
+    fs.writeText(BASE, json.stringify(resto, 2) + "\n")?
+    usb.loadIds(BASE)?
+    return true, nil
+}
+
+// Resumo do conteúdo analisado pela lib (r.content).
+fn resumo(c) {
+    const t = c.type
+    if t == "pix" || t == "emv_qr" { return `PIX: ${c.get("merchant", "")}, valor ${c.get("amount", "aberto")}, chave ${c.get("key", c.get("url", ""))}, CRC ok ${c.valid}` }
+    if t == "nfce" { return `NFC-e: chave ${c.key} (válida: ${c.valid})` }
+    if t == "nfe_key" { return `chave ${c.model}: UF ${c.uf}, CNPJ ${c.cnpj}, número ${c.number}` }
+    if t == "boleto" || t == "boleto_linha" { return `boleto (DV ok: ${c.valid})` }
+    if t == "arrecadacao" || t == "arrecadacao_linha" { return `arrecadação (DV ok: ${c.valid})` }
+    if t == "gs1" { return `GS1: ${json.stringify(c.fields)}` }
+    if t == "wifi" { return `Wi-Fi: rede ${c.ssid}, senha ${c.get("password", "")}` }
+    if t == "vcard" { return `vCard: ${c.get("name", "")} ${c.get("phone", "")} ${c.get("email", "")}` }
+    if t == "url" { return `URL: ${c.url}` }
+    if c.get("valid") != nil { return `${t} ${c.get("code", "")} (dígito verificador ok: ${c.valid})` }
+    return t
+}
+
+fn linhaCsv(r) {
+    const campos = [str(r.time), r.text, r.symbology ?? "", r.content.type, r.source ?? ""]
+    const out = []
+    for c in campos { out.push(`"${str(c).replace(`"`, `""`)}"`) }
+    return out.join(";") + "\n"
+}
+
+fn main() {
+    const opts = cli.parse(SPEC, system.args)
+    if fs.exists(BASE) { usb.loadIds(BASE)? }
+    if fs.exists("data/usb.ids") { usb.loadIds("data/usb.ids")? }
+
+    // 1. que leitor usar
+    let seletor = opts.leitor
+    if seletor == "" {
+        const lista = usb.scanners()?
+        if len(lista) > 0 && !opts.aprender {
+            for d in lista { print(`leitor: ${d.name} (${d.id}, ${d.vid}:${d.pid}, modos ${d.modes.join(", ")})`) }
+            seletor = lista[0].id
+        } else {
+            if opts.aprender { print("escutando todos os teclados: leia um código com o leitor (60s)...") }
+            else { print("nenhum leitor reconhecido; leia um código com o leitor para eu descobrir qual teclado ele é (60s)...") }
+            const d = usb.detectScanner(60s, { layout: opts.layout })?
+            if d == nil { return nil, error("nada foi lido; confira se o leitor está ligado (LED/bipe) e em modo teclado USB (HID), e rode de novo") }
+            print(`lido "${d.text}" vindo de ${d.source}`)
+            if d.device == nil {
+                print("não achei o aparelho USB desse teclado; lendo de qualquer teclado (só rajadas de leitor)")
+                seletor = "keyboard"
+            } else {
+                aprender(d.device)?
+                print(`gravado em ${BASE}: ${d.device.vid}:${d.device.pid} = leitor de código de barras`)
+                seletor = d.device.id
+            }
+        }
+    }
+
+    // 2. abrir e ler
+    const s = usb.openScanner(seletor, { exclusive: opts.exclusivo, layout: opts.layout })?
+    let espera = opts.espera * 1000
+    if espera == 0 { espera = -1 }
+    print(`modo ${s.mode}; leia códigos (${opts.espera}s sem leitura encerra; Ctrl+C para sair)`)
+    let n = 0
+    while true {
+        const r = s.read(espera)?
+        if r == nil { break }
+        n += 1
+        let sym = ""
+        if r.symbology != nil { sym = ` [${r.symbology}]` }
+        print(`${n}. ${r.text}${sym}`)
+        print(`   ${resumo(r.content)}`)
+        if opts.csv != "" {
+            let atual = ""
+            if fs.exists(opts.csv) { atual = fs.readText(opts.csv)? }
+            if atual == "" { atual = "hora;texto;simbologia;tipo;origem\n" }
+            fs.writeText(opts.csv, atual + linhaCsv(r))?
+        }
+    }
+    if n == 0 && s.mode == "keyboard" {
+        // Diagnóstico da captura de teclado (Raw Input, Windows): inputs = eventos
+        // que chegaram; keys = com tecla válida. inputs > 0 e keys == 0 quer dizer
+        // que o Windows entregou os eventos zerados (proteção contra captura).
+        const st = (s.info()?).get("hook_stats")
+        if st != nil { print(`nada lido. captura de teclado: ${st.get("inputs", 0)} eventos recebidos, ${st.get("keys", 0)} teclas válidas, ${st.get("delivered", 0)} entregues`) }
+        print("dicas: o leitor bipa ao ler? está em modo teclado USB (HID)? tente --leitor keyboard, ou --aprender")
+    }
+    s.close()?
+    print(`${n} leitura(s)`)
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil {
+    print(`erro: ${err.message}`)
+    system.exit(1)
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "vid": "0c2e",
+    "pid": "0b61",
+    "name": "Leitor do caixa 1 (exemplo de base própria)",
+    "kind": "barcode_scanner"
+  },
+  {
+    "vid": "1a86",
+    "pid": "7523",
+    "name": "Balança do balcão via CH340 (exemplo)",
+    "kind": "scale"
+  },
+  {
+    "vid": "c0f4",
+    "pid": "05c0",
+    "name": "Leitor de código de barras (modo teclado)",
+    "kind": "barcode_scanner"
+  }
+]

@@ -1,0 +1,367 @@
+// _native.fg — carrega a parte nativa (cdylib Rust) de uma lib Fogu e
+// conversa com ela pelo fogu:ffi, usando os callbacks do Fogu 0.7+ (testado com o 0.7.4).
+// O mesmo arquivo é usado por todas as libs deste repositório.
+//
+//   const native = new Native("sshserver", "fogussh", "fssh", SIGNATURES, "FOGU_SSH_LIB")
+//   native.load()?                 // procura e abre a lib (uma vez)
+//   native.api.fssh_send(...)       // funções declaradas em SIGNATURES
+//   native.text((b, n) => native.api.fssh_version(b, n))?   // saída pelo sink
+//
+// Saídas (sink): a lib nativa recebe um ffi.callback em <prefix>_set_sink e,
+// chamada com buf = nil e cap = 0, entrega o texto por ele — sem buffer fixo e
+// sem a segunda chamada quando a saída não cabia (que repetia o trabalho).
+//
+// Eventos (Pump): <prefix>_dispatch(handle, timeoutMs, max, cb) entrega um lote
+// de eventos (JSON + bytes) pelo callback. O callback só guarda o evento: um
+// erro dentro de um callback do fogu:ffi derruba o programa, então os handlers
+// do usuário rodam depois, fora do frame nativo (com ?, erros e sleep normais).
+//
+// Esperas longas são feitas em fatias (SLICE_MS) cedendo a vez entre elas:
+// uma chamada FFI bloqueante congela todas as tarefas fg.
+//
+// Fogu 0.7.4: o código compilado (JIT) chama direto as funções FFI de
+// assinatura numérica (ints, ptr como int, f64, bool) — sem alocação nem
+// busca de nome por chamada —, então os laços de *_status/*_poll são baratos;
+// os nomes de tipo do Go (int32, uint8, float64...) também valem nas
+// assinaturas, ao lado de i32/u8/f64.
+import ffi from "fogu:ffi"
+import fs from "fogu:fs"
+import json from "fogu:json"
+import path from "fogu:path"
+import system from "fogu:system"
+import time from "fogu:time"
+
+// Quanto uma espera nativa pode bloquear antes de devolver a vez às tarefas fg
+// (o mesmo valor do pacote oficial `hardware`).
+export const SLICE_MS = 10
+
+let _coop = true
+
+// setCooperative(on): true (padrão) espera em fatias de SLICE_MS e cede a vez
+// entre elas (as outras tarefas fg continuam rodando); false espera direto na
+// lib nativa (menor latência para laços apertados, mas congela as outras
+// tarefas até o evento chegar ou o tempo acabar).
+export fn setCooperative(on) {
+    _coop = on != false && on != nil
+    return nil
+}
+
+export fn cooperative() { return _coop }
+
+// Cede a vez às outras tarefas fg. time.delay(0ms) só roda as tarefas prontas;
+// 1ms também acorda as que estão num delay/sleep vencido.
+export fn yieldNow() {
+    time.delay(1ms)
+    return nil
+}
+
+// Quanto esperar na próxima chamada nativa: uma fatia (modo cooperativo) ou
+// tudo o que falta; 0 quando o tempo acabou. timeoutMs < 0 = sem limite.
+export fn sliceFor(timeoutMs, deadline) {
+    let left = 2147483647
+    if timeoutMs >= 0 {
+        left = int((deadline - time.monotonic()) * 1000.0)
+        if left < 0 { left = 0 }
+    }
+    if _coop && left > SLICE_MS { return SLICE_MS }
+    return left
+}
+
+// Prazo (time.monotonic) de uma espera de timeoutMs.
+export fn deadlineOf(timeoutMs) {
+    return time.monotonic() + float(timeoutMs) / 1000.0
+}
+
+// Espera cooperativa genérica: chama attempt(sliceMs) — uma chamada nativa que
+// espera no máximo sliceMs e devolve o resultado, ou nil/[] se nada chegou —
+// até ter um resultado ou timeoutMs acabar (-1 = sem limite), cedendo a vez às
+// tarefas fg entre as tentativas. Devolve o resultado ou nil.
+export fn waitLoop(timeoutMs, attempt) {
+    const deadline = deadlineOf(timeoutMs)
+    while true {
+        const r = attempt(sliceFor(timeoutMs, deadline))?
+        if r != nil && !(typeof(r) == "list" && len(r) == 0) { return r, nil }
+        if timeoutMs >= 0 && time.monotonic() >= deadline { return r, nil }
+        if _coop { yieldNow() }
+    }
+    return nil, nil
+}
+
+const _ARCHS = { x86_64: "x64", amd64: "x64", aarch64: "arm64", arm64: "arm64", x86: "x86", i686: "x86", i386: "x86", arm: "armv7", armv7: "armv7" }
+
+// Plataforma no formato dos targets do Fogu: windows-x64, linux-arm64, macos-arm64...
+export fn platform() {
+    const arch = system.info.arch
+    return `${system.info.os}-${_ARCHS.get(arch) ?? arch}`
+}
+
+// Duração (5s, 200ms) ou número de ms -> ms (int). -1 = sem limite.
+export fn ms(timeout) {
+    if timeout == nil { return -1 }
+    if typeof(timeout) == "duration" { return int(timeout.ms) }
+    return int(timeout)
+}
+
+fn _env(name) {
+    const v = Fogu.env[name]
+    if v == nil || v == "" { return nil }
+    return v
+}
+
+fn _clean(p) {
+    if p.starts_with("//?/") || p.starts_with("\\\\?\\") { return p.slice(4) }
+    return p
+}
+
+// Bytes para passar como "buffer": aceita buffer, str ou lista de bytes.
+export fn mem(data) {
+    const b = bytes(data)
+    const m = ffi.alloc(len(b) + 1)
+    if len(b) > 0 { m.write(0, b) }
+    return m, len(b)
+}
+
+export struct Native {
+    pkg = ""
+    name = ""
+    prefix = ""
+    envVar = ""
+    sigs = nil
+    api = nil
+    path = nil
+    oses = nil
+    loadError = nil
+    _lib = nil
+    _box = nil
+    _sink = nil
+
+    // oses: sistemas suportados (["windows"], ["windows", "linux"]...); nil = todos.
+    new(pkg, name, prefix, sigs, envVar = "", oses = nil) {
+        this.pkg = pkg
+        this.name = name
+        this.prefix = prefix
+        this.sigs = sigs
+        this.envVar = envVar
+        this.oses = oses
+        this.api = {}
+    }
+
+    loaded() { return this.path != nil }
+
+    // Chamado no import da lib: reconhece o sistema e a arquitetura e já abre
+    // o binário certo (native/<so>-<arch>/...). Não para o programa se falhar:
+    // o erro fica em loadError e volta na primeira chamada que precisar da lib.
+    autoload() {
+        const [_ok, err] = this.load()
+        this.loadError = err
+        return this
+    }
+
+    // { platform, os, file, path, loaded, error } — o que foi detectado e carregado.
+    info() {
+        let msg = nil
+        if this.loadError != nil { msg = this.loadError.message }
+        return { platform: platform(), os: system.info.os, file: this.fileName(), path: this.path, loaded: this.path != nil, error: msg }
+    }
+
+    // Nome do arquivo nesta plataforma: fogussh.dll, libfogussh.so, libfogussh.dylib.
+    fileName() {
+        if ffi.suffix == ".dll" { return this.name + ffi.suffix }
+        return "lib" + this.name + ffi.suffix
+    }
+
+    // Onde a lib é procurada, em ordem: o caminho dado, a variável de ambiente,
+    // o projeto em execução (native/<plataforma>/, native/, o build do cargo),
+    // um pacote copiado em fogu_modules/ e os pacotes instalados com `fogu add`.
+    candidates(explicit = nil) {
+        const file = this.fileName()
+        const plat = platform()
+        const out = []
+        const add = (p) => {
+            if p == nil { return }
+            if fs.isDir(p) { out.push(path.join(p, file)) } else { out.push(p) }
+        }
+        const addBase = (base) => {
+            out.push(path.join(base, "native", plat, file))
+            out.push(path.join(base, "native", file))
+            out.push(path.join(base, this.name, "target", "release", file))
+        }
+        add(explicit)
+        if this.envVar != "" { add(_env(this.envVar)) }
+        addBase(_clean(Fogu.asset(".")))
+        addBase(".")
+        addBase(_clean(Fogu.asset(path.join("fogu_modules", this.pkg))))
+        const home = _env("FOGU_HOME") ?? (_env("USERPROFILE") ?? _env("HOME"))
+        if home != nil {
+            let root = home
+            if _env("FOGU_HOME") == nil { root = path.join(home, ".fogu") }
+            for dir in Fogu.glob(path.join(root, "fogu_modules", this.pkg + "@*")) { addBase(dir) }
+        }
+        return out
+    }
+
+    // Abre a lib (uma vez), declara as funções e registra o sink.
+    load(explicit = nil) {
+        if this.path != nil { return true, nil }
+        if this.oses != nil && !this.oses.contains(system.info.os) {
+            return nil, error(`${this.pkg}: não funciona em ${platform()} (sistemas suportados: ${this.oses.join(", ")})`)
+        }
+        const tried = []
+        for p in this.candidates(explicit) {
+            if !fs.isFile(p) {
+                if !tried.contains(p) { tried.push(p) }
+                continue
+            }
+            const [lib, err] = ffi.open(p)
+            if err != nil { return nil, error(`${this.pkg}: não foi possível carregar ${p}: ${err.message}`) }
+            this._lib = lib
+            this.path = p
+            const [_d, derr] = this._bind(this.sigs)
+            if derr != nil {
+                this.path = nil
+                this._lib = nil
+                return nil, derr
+            }
+            // O sink guarda a última saída; quem chamou a lê logo em seguida.
+            const box = { text: nil, raw: false }
+            this._box = box
+            this._sink = ffi.callback(fn(p, n) {
+                if box.raw { box.text = ffi.bytes(p, n) } else { box.text = ffi.string(p, n) }
+                return 1
+            }, ["ptr", "usize"], "i32")
+            this.api[this.prefix + "_set_sink"](this._sink)
+            this.path = p
+            this.loadError = nil
+            return true, nil
+        }
+        return nil, error(`${this.pkg}: biblioteca nativa ${this.fileName()} não encontrada para ${platform()} (rode: fogu run build:native, ou defina ${this.envVar}). Procurei em:\n  ${tried.join("\n  ")}`)
+    }
+
+    // Declara mais funções (para módulos que dividem a mesma lib nativa, como
+    // tela.fg e som.fg do hdmi). Antes do load só as guarda; depois, já as liga.
+    declare(sigs) {
+        for fname, sig in sigs { this.sigs[fname] = sig }
+        if this._lib != nil { return this._bind(sigs) }
+        return true, nil
+    }
+
+    _bind(sigs) {
+        for fname, sig in sigs {
+            const [f, ferr] = this._lib.func(fname, sig[0], sig[1])
+            if ferr != nil { return nil, error(`${this.pkg}: ${this.path} não tem ${fname} (lib antiga? rode o build:native): ${ferr.message}`) }
+            this.api[fname] = f
+        }
+        return true, nil
+    }
+
+    // Garante a lib carregada (para funções sem tratamento de erro).
+    ensure() {
+        if this.path == nil { this.load()? }
+        return true, nil
+    }
+
+    // Última mensagem de erro da lib, como error.
+    lastError() {
+        this._box.raw = false
+        this._box.text = nil
+        this.api[this.prefix + "_last_error"](nil, 0)
+        return error(this._box.text ?? `${this.pkg}: erro desconhecido`)
+    }
+
+    // rc < 0 -> erro da lib; senão true.
+    status(rc) {
+        if rc < 0 { return nil, this.lastError() }
+        return true, nil
+    }
+
+    // Número da lib (>= 0) ou o erro dela.
+    num(n) {
+        if n < 0 { return nil, this.lastError() }
+        return n, nil
+    }
+
+    // Chama f(nil, 0); a lib entrega a saída (texto) pelo sink.
+    text(f) {
+        this._box.raw = false
+        this._box.text = nil
+        const n = f(nil, 0)
+        if n < 0 { return nil, this.lastError() }
+        const s = this._box.text
+        this._box.text = nil
+        return s ?? "", nil
+    }
+
+    // Como text(), mas a saída é JSON.
+    json(f) {
+        const s = this.text(f)?
+        const v = json.parse(s)?
+        return v, nil
+    }
+
+    // Como text(), mas a saída são bytes (buffer).
+    bytes(f) {
+        this._box.raw = true
+        this._box.text = nil
+        const n = f(nil, 0)
+        this._box.raw = false
+        if n < 0 { return nil, this.lastError() }
+        const b = this._box.text
+        this._box.text = nil
+        return b, nil
+    }
+}
+
+// Recebe os eventos de <prefix>_dispatch pelo callback e os entrega já
+// decodificados: { ...json, bytes? } (bytes = payload binário, se houver).
+export struct Pump {
+    cb = nil
+    _box = nil
+
+    new() {
+        const box = { items: [] }
+        this._box = box
+        this.cb = ffi.callback(fn(j, jn, b, bn) {
+            let bin = nil
+            if bn > 0 { bin = ffi.bytes(b, bn) }
+            box.items.push([ffi.string(j, jn), bin])
+            return 1
+        }, ["ptr", "usize", "ptr", "usize"], "i32")
+    }
+
+    // Chama dispatch(cb) (que devolve quantos eventos entregou, ou < 0 em erro)
+    // e devolve a lista de eventos recebidos.
+    take(dispatch, onError) {
+        this._box.items = []
+        const n = dispatch(this.cb)
+        if n < 0 { return nil, onError() }
+        const out = []
+        for it in this._box.items {
+            const ev = json.parse(it[0])?
+            if it[1] != nil { ev.bytes = it[1] }
+            out.push(ev)
+        }
+        this._box.items = []
+        return out, nil
+    }
+
+    // Espera até timeoutMs (-1 = sem limite) por eventos, em fatias de SLICE_MS
+    // cedendo a vez às outras tarefas fg. Devolve a lista (vazia se o tempo
+    // acabou) ou para quando alive() fica false.
+    wait(timeoutMs, dispatch, onError, alive = nil) {
+        const deadline = deadlineOf(timeoutMs)
+        while true {
+            const slice = sliceFor(timeoutMs, deadline)
+            const evs = this.take((cb) => dispatch(slice, cb), onError)?
+            if len(evs) > 0 { return evs, nil }
+            if alive != nil && !alive() { return [], nil }
+            if timeoutMs >= 0 && time.monotonic() >= deadline { return [], nil }
+            if _coop { yieldNow() }
+        }
+        return [], nil
+    }
+
+    close() {
+        if this.cb != nil { this.cb.close() }
+        this.cb = nil
+    }
+}

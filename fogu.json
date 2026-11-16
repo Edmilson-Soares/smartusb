@@ -1,0 +1,18 @@
+{
+  "name": "smartusb",
+  "version": "0.1.0",
+  "entry": "main.fg",
+  "scripts": {
+    "start": "fogu run main.fg",
+    "dev": "fogu --watch main.fg",
+    "test": "fogu test",
+    "build:native": "powershell -ExecutionPolicy Bypass -File build.ps1",
+    "build:unix": "sh build.sh",
+    "build:all": "sh build.sh all",
+    "usbids": "powershell -ExecutionPolicy Bypass -File usbids.ps1",
+    "cartao": "fogu run examples/cartao.fg",
+    "barcode": "fogu run examples/barcode.fg",
+    "pendrive": "fogu run examples/pendrive.fg"
+  },
+  "dependencies": {}
+}

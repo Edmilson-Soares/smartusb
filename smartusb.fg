@@ -1,0 +1,628 @@
+// smartusb.fg — aparelhos USB para Fogu, sobre a lib Rust fogusmartusb via
+// fogu:ffi: lista e reconhece o que está conectado (leitor de código de
+// barras/QR, smart card, NFC, token, biometria, balança, impressora...),
+// avisa quando algo é conectado/desconectado e lê scanners em qualquer
+// modo (HID POS, serial/COM ou teclado). Veja README.md.
+import { Native, ms as _nms, waitLoop, setCooperative as _setCoop } from "./_native.fg"
+import json from "fogu:json"
+
+const _SIGNATURES = {
+    fsu_set_sink: [["ptr"], "i32"],
+    fsu_version: [["buffer", "i64"], "i64"],
+    fsu_last_error: [["buffer", "i64"], "i64"],
+    fsu_pending: [["buffer", "i64"], "i64"],
+    fsu_devices: [["i32", "buffer", "i64"], "i64"],
+    fsu_device: [["str", "buffer", "i64"], "i64"],
+    fsu_identify: [["str", "buffer", "i64"], "i64"],
+    fsu_db_load: [["str"], "i64"],
+    fsu_db_clear: [[], "i32"],
+    fsu_db_count: [[], "i64"],
+    fsu_pcsc_readers: [["buffer", "i64"], "i64"],
+    fsu_watch_open: [["i32"], "i64"],
+    fsu_watch_wait: [["i64", "i64", "buffer", "i64"], "i64"],
+    fsu_watch_close: [["i64"], "i32"],
+    fsu_scanner_open: [["str", "str"], "i64"],
+    fsu_scanner_read: [["i64", "i64", "buffer", "i64"], "i64"],
+    fsu_scanner_write: [["i64", "str"], "i64"],
+    fsu_scanner_info: [["i64", "buffer", "i64"], "i64"],
+    fsu_scanner_close: [["i64"], "i32"],
+    fsu_analyze: [["str", "buffer", "i64"], "i64"],
+    fsu_hid_open: [["str", "str"], "i64"],
+    fsu_hid_read: [["i64", "i64", "buffer", "i64"], "i64"],
+    fsu_hid_write: [["i64", "str"], "i64"],
+    fsu_hid_get_feature: [["i64", "i32", "i64", "buffer", "i64"], "i64"],
+    fsu_hid_send_feature: [["i64", "str"], "i32"],
+    fsu_hid_info: [["i64", "buffer", "i64"], "i64"],
+    fsu_hid_close: [["i64"], "i32"],
+    fsu_printers: [["buffer", "i64"], "i64"],
+    fsu_printer_open: [["str", "str"], "i64"],
+    fsu_printer_write: [["i64", "str"], "i64"],
+    fsu_printer_read: [["i64", "i64", "i64", "buffer", "i64"], "i64"],
+    fsu_printer_info: [["i64", "buffer", "i64"], "i64"],
+    fsu_printer_close: [["i64"], "i32"],
+    fsu_escpos: [["str", "buffer", "i64"], "i64"],
+    fsu_encode: [["str", "str", "buffer", "i64"], "i64"],
+    fsu_bio_units: [["buffer", "i64"], "i64"],
+    fsu_bio_identify: [["i64", "buffer", "i64"], "i64"],
+    fsu_bio_capture: [["i64", "str", "buffer", "i64"], "i64"],
+}
+
+const _native = new Native("smartusb", "fogusmartusb", "fsu", _SIGNATURES, "FOGU_SMARTUSB_LIB", nil)
+const _fn = _native.api
+
+// No import: reconhece o sistema e a arquitetura e já carrega o binário
+// certo (native/<so>-<arch>/...). Se faltar, o erro volta na primeira chamada.
+_native.autoload()
+
+// O que foi detectado e carregado: { platform, os, file, path, loaded, error }.
+export fn nativeInfo() { return _native.info() }
+
+// setCooperative(false): esperas direto na lib (menor latência; congela as
+// outras tarefas fg enquanto espera). Padrão: true (esperas em fatias).
+export fn setCooperative(on) { return _setCoop(on) }
+
+// Tipos que a API de scanner sabe ler.
+export const SCANNER_KINDS = ["barcode_scanner", "rfid_reader", "msr", "scale"]
+// Tipos que se usam com o fogusmartcard (PC/SC).
+export const SMARTCARD_KINDS = ["smartcard_reader", "nfc_reader", "security_token"]
+
+// Carrega a biblioteca nativa (native/<plataforma>/fogusmartusb, native/fogusmartusb,
+// o build do cargo ou FOGU_SMARTUSB_LIB). `path` força um arquivo ou pasta.
+export fn load(path = nil) {
+    return _native.load(path)
+}
+
+// Caminho da lib carregada (nil antes de load()).
+export fn libraryPath() { return _native.path }
+
+fn _last_error() { return _native.lastError() }
+
+fn _status(rc) { return _native.status(rc) }
+
+// Saídas da lib: chegam inteiras pelo callback (sink) do _native.fg, sem
+// buffer fixo nem a segunda chamada de *_pending. cap é ignorado (compatibilidade).
+struct _Out {
+    new(cap = 0) {}
+    text(f) { return _native.text(f) }
+    json(f) { return _native.json(f) }
+}
+
+// Bytes como hex: aceita str (já em hex), buffer ou lista de inteiros.
+export fn hex(value) {
+    if value == nil { return "" }
+    const t = typeof(value)
+    if t == "str" { return value }
+    if t == "buffer" { return value.hex() }
+    return bytes(value).hex()
+}
+
+// hex -> buffer
+export fn fromHex(text) {
+    if text == "" { return bytes([]) }
+    return bytes(text, "hex")
+}
+
+fn _ms(timeout) { return _nms(timeout) }
+
+fn _has(list, value) {
+    for x in list { if x == value { return true } }
+    return false
+}
+
+// kind pode ser "" (todos), um tipo ou uma lista de tipos.
+fn _kindMatches(device, kind) {
+    if kind == "" || kind == nil { return true }
+    if typeof(kind) == "str" { return device.kind == kind || _has(device.kinds, kind) }
+    for k in kind {
+        if device.kind == k || _has(device.kinds, k) { return true }
+    }
+    return false
+}
+
+export fn version() {
+    load()?
+    return _native.text((b, n) => _fn.fsu_version(b, n))
+}
+
+// ---- aparelhos ----
+
+// Aparelhos USB conectados, já reconhecidos:
+// [{ id, vid, pid, name, kind, kinds, category, confidence, source, vendor,
+//    product, serial, modes, ports, readers, interfaces, hid, speed, ... }]
+// kind filtra por tipo ("barcode_scanner" ou lista); hubs inclui os hubs.
+export fn devices(kind = "", hubs = false) {
+    load()?
+    let flags = 0
+    if hubs { flags = 1 }
+    const list = new _Out(262144).json((b, n) => _fn.fsu_devices(flags, b, n))?
+    if kind == "" { return list, nil }
+    const out = []
+    for d in list {
+        if _kindMatches(d, kind) { out.push(d) }
+    }
+    return out, nil
+}
+
+// Um aparelho pelo id, "vvvv:pppp", "vvvv:pppp:serial" ou porta ("COM5").
+export fn device(selector) {
+    load()?
+    return new _Out(65536).json((b, n) => _fn.fsu_device(selector, b, n))
+}
+
+// Primeiro aparelho do tipo (ou lista de tipos), nil se não houver.
+export fn find(kind) {
+    const list = devices(kind)?
+    if len(list) == 0 { return nil, nil }
+    return list[0], nil
+}
+
+// Scanners de código de barras/QR, leitores RFID por teclado, tarja e balanças.
+export fn scanners() {
+    return devices(SCANNER_KINDS)
+}
+
+// Leitores de smart card, NFC e tokens (use com o módulo scard do smartcard).
+export fn smartcardReaders() {
+    return devices(SMARTCARD_KINDS)
+}
+
+// Reconhece um aparelho descrito à mão, sem ele conectado:
+// { vid, pid, product?, manufacturer?, interfaces?: [{ class, subclass, protocol }],
+//   hid?: [{ usage_page, usage }], ports? } -> { name, kind, category, modes, ... }
+export fn identify(desc) {
+    load()?
+    return new _Out(8192).json((b, n) => _fn.fsu_identify(json.stringify(desc), b, n))
+}
+
+// Carrega uma base: um .json próprio [{ vid, pid?, name?, vendor?, kind? }]
+// (tem precedência) ou o usb.ids do linux-usb.org (nomes de ~20 mil
+// aparelhos; fogu run usbids baixa). Devolve quantas entradas entraram.
+export fn loadIds(path) {
+    load()?
+    const n = _fn.fsu_db_load(path)
+    if n < 0 { return nil, _last_error() }
+    return n, nil
+}
+
+export fn clearIds() {
+    load()?
+    _fn.fsu_db_clear()
+    return true, nil
+}
+
+export fn idsSize() {
+    load()?
+    return _fn.fsu_db_count(), nil
+}
+
+// Nomes dos leitores PC/SC (os que o fogusmartcard usa em connect()).
+export fn pcscReaders() {
+    load()?
+    return new _Out(16384).json((b, n) => _fn.fsu_pcsc_readers(b, n))
+}
+
+// Analisa um texto lido, sem scanner: { text, aim, symbology, content }.
+// content.type: url, pix, emv_qr, nfce, nfe_key, boleto, arrecadacao, ean13,
+// ean8, upca, gtin14, gs1, cpf, cnpj, wifi, vcard, email, phone, json, number, text...
+export fn analyze(text) {
+    load()?
+    return new _Out(65536).json((b, n) => _fn.fsu_analyze(text, b, n))
+}
+
+// ---- conectar / desconectar ----
+
+export struct Watcher {
+    handle = 0
+    _out = nil
+
+    new(handle) {
+        this.handle = handle
+        this._out = new _Out(262144)
+    }
+
+    // Espera até timeout (duração como 5s, ou ms; -1 = sem limite) por eventos:
+    // [{ event: "added" | "removed" | "changed", id, kind, name, device }];
+    // [] se o tempo acabou. Na primeira chamada os aparelhos presentes vêm
+    // como "added". "changed": apareceu a porta COM/leitor PC/SC depois.
+    wait(timeout = -1) {
+        // em fatias (setCooperative): as outras tarefas fg rodam enquanto espera
+        return waitLoop(_ms(timeout), (slice) => this._out.json((b, n) => _fn.fsu_watch_wait(this.handle, slice, b, n)))
+    }
+
+    // Espera conectar um aparelho do tipo (ou lista de tipos; "" = qualquer)
+    // e devolve o aparelho; nil se o tempo acabar. Um que já esteja
+    // conectado conta (vem como "added" na primeira espera).
+    waitFor(kind = "", timeout = -1) {
+        while true {
+            const events = this.wait(timeout)?
+            if len(events) == 0 { return nil, nil }
+            for ev in events {
+                if ev.event == "added" && _kindMatches(ev.device, kind) { return ev.device, nil }
+            }
+        }
+        return nil, nil
+    }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _fn.fsu_watch_close(this.handle)
+        this.handle = 0
+        return _status(rc)
+    }
+}
+
+// Observa conexões USB. hubs inclui os hubs.
+export fn watch(hubs = false) {
+    load()?
+    let flags = 0
+    if hubs { flags = 1 }
+    const h = _fn.fsu_watch_open(flags)
+    if h < 0 { return nil, _last_error() }
+    return new Watcher(h), nil
+}
+
+// ---- scanners ----
+
+export struct Scanner {
+    handle = 0
+    mode = ""
+    target = ""
+    device = nil
+    _out = nil
+
+    new(handle) {
+        this.handle = handle
+        this._out = new _Out(65536)
+    }
+
+    _refresh() {
+        const i = this.info()?
+        this.mode = i.mode
+        this.target = i.target
+        this.device = i.device
+        return true, nil
+    }
+
+    // Espera uma leitura (timeout: duração ou ms; -1 = sem limite):
+    // { text, raw, mode, aim, symbology, content, device, source, time }
+    // ou nil se o tempo acabar. Em modo teclado vêm também keys,
+    // avg_gap_ms e terminator.
+    read(timeout = -1) {
+        // em fatias (setCooperative); o que já chegou fica guardado na lib entre as fatias
+        return waitLoop(_ms(timeout), (slice) => this._out.json((b, n) => _fn.fsu_scanner_read(this.handle, slice, b, n)))
+    }
+
+    // Só o texto lido (ou nil se o tempo acabar).
+    readText(timeout = -1) {
+        const r = this.read(timeout)?
+        if r == nil { return nil, nil }
+        return r.text, nil
+    }
+
+    // Envia comandos ao scanner (modo serial ou HID): hex, buffer, lista ou
+    // texto com write(text, true).
+    write(data, isText = false) {
+        let h = ""
+        if isText { h = bytes(data).hex() } else { h = hex(data) }
+        const n = _fn.fsu_scanner_write(this.handle, h)
+        if n < 0 { return nil, _last_error() }
+        return n, nil
+    }
+
+    // { mode, target, device, layout, idle_ms, min_length, max_gap_ms }
+    info() {
+        return this._out.json((b, n) => _fn.fsu_scanner_info(this.handle, b, n))
+    }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _fn.fsu_scanner_close(this.handle)
+        this.handle = 0
+        return _status(rc)
+    }
+}
+
+// Abre um scanner.
+//   selector: "" (o primeiro reconhecido), id, "vvvv:pppp", porta ("COM5",
+//             "/dev/ttyACM0"), caminho HID, ou "keyboard" (qualquer teclado,
+//             aceitando só rajadas rápidas como as de um scanner).
+//   options:  mode ("auto" | "hidpos" | "serial" | "keyboard" | "hid"),
+//             layout ("us" | "abnt2": o layout que o scanner emula),
+//             terminator ("enter" | "tab"), idle_ms, min_length,
+//             max_gap_ms (ou false), baud, port, usage_page, aim (true),
+//             exclusive (modo teclado, Windows: as teclas do scanner não
+//             chegam à janela em foco; precisa de um scanner específico).
+export fn openScanner(selector = "", options = {}) {
+    load()?
+    const h = _fn.fsu_scanner_open(selector, json.stringify(options))
+    if h < 0 { return nil, _last_error() }
+    const s = new Scanner(h)
+    s._refresh()?
+    return s, nil
+}
+
+// Uma leitura e fecha: o resultado de Scanner.read, ou nil.
+export fn scan(timeout = -1, selector = "", options = {}) {
+    const s = openScanner(selector, options)?
+    const [r, err] = s.read(timeout)
+    s.close()?
+    if err != nil { return nil, err }
+    return r, nil
+}
+
+// Descobre qual teclado é um scanner: escuta todos e devolve o primeiro que
+// mandar uma rajada de leitura, com o aparelho (se USB):
+// { text, source: "vvvv:pppp", device, scan }; nil se o tempo acabar.
+// Útil para scanners baratos que se apresentam só como "USB Keyboard";
+// depois grave o VID/PID numa base própria (loadIds) com kind "barcode_scanner".
+export fn detectScanner(timeout = 30000, options = {}) {
+    const s = openScanner("keyboard", options)?
+    const [r, err] = s.read(timeout)
+    s.close()?
+    if err != nil { return nil, err }
+    if r == nil { return nil, nil }
+    let dev = nil
+    if r.source != nil {
+        const [d, _e] = device(r.source)
+        dev = d
+    }
+    return { text: r.text, source: r.source, device: dev, scan: r }, nil
+}
+
+// ---- HID genérico ----
+
+export struct Hid {
+    handle = 0
+    _out = nil
+
+    new(handle) {
+        this.handle = handle
+        this._out = new _Out(16384)
+    }
+
+    // Um relatório de entrada (buffer), ou nil se o tempo acabar.
+    read(timeout = -1) {
+        const h = waitLoop(_ms(timeout), (slice) => {
+            const r = this._out.text((b, n) => _fn.fsu_hid_read(this.handle, slice, b, n))?
+            if r == "" { return nil, nil }
+            return r, nil
+        })?
+        if h == nil { return nil, nil }
+        return fromHex(h), nil
+    }
+
+    // Relatório de saída; o 1º byte é o número do relatório (0 se não usa).
+    write(data) {
+        const n = _fn.fsu_hid_write(this.handle, hex(data))
+        if n < 0 { return nil, _last_error() }
+        return n, nil
+    }
+
+    getFeature(reportId, length = 64) {
+        const h = this._out.text((b, n) => _fn.fsu_hid_get_feature(this.handle, reportId, length, b, n))?
+        return fromHex(h), nil
+    }
+
+    sendFeature(data) {
+        return _status(_fn.fsu_hid_send_feature(this.handle, hex(data)))
+    }
+
+    // { path, usage_page, usage, vid, pid, product, manufacturer, serial }
+    info() {
+        return this._out.json((b, n) => _fn.fsu_hid_info(this.handle, b, n))
+    }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _fn.fsu_hid_close(this.handle)
+        this.handle = 0
+        return _status(rc)
+    }
+}
+
+// Abre um aparelho HID: caminho (device.hid[i].path), id ou "vvvv:pppp".
+// options: { usage_page, usage, interface } para escolher a coleção.
+export fn openHid(selector, options = {}) {
+    load()?
+    const h = _fn.fsu_hid_open(selector, json.stringify(options))
+    if h < 0 { return nil, _last_error() }
+    return new Hid(h), nil
+}
+
+// ---- impressoras ----
+
+// { usb: [aparelhos], system: [{ name, port, driver, default }] (Windows),
+//   usbprint: [caminhos] (Windows) }
+export fn printers() {
+    load()?
+    return new _Out(262144).json((b, n) => _fn.fsu_printers(b, n))
+}
+
+// Bytes ESC/POS de uma lista de comandos (veja Receipt e o README).
+export fn escpos(commands) {
+    load()?
+    const h = new _Out(65536).text((b, n) => _fn.fsu_escpos(json.stringify(commands), b, n))?
+    return fromHex(h), nil
+}
+
+// Texto na página de código da impressora: "cp437", "cp850", "cp860",
+// "cp1252", "latin1" ou "utf8".
+export fn encode(text, codepage = "cp860") {
+    load()?
+    const h = new _Out(65536).text((b, n) => _fn.fsu_encode(text, codepage, b, n))?
+    return fromHex(h), nil
+}
+
+export struct Printer {
+    handle = 0
+    backend = ""
+    target = ""
+    _out = nil
+
+    new(handle) {
+        this.handle = handle
+        this._out = new _Out(65536)
+    }
+
+    // Bytes crus (hex, buffer ou lista). No spooler cada chamada é um trabalho.
+    write(data) {
+        const n = _fn.fsu_printer_write(this.handle, hex(data))
+        if n < 0 { return nil, _last_error() }
+        return n, nil
+    }
+
+    // Imprime um Receipt ou uma lista de comandos ESC/POS.
+    print(receipt) {
+        let cmds = receipt
+        if typeof(receipt) != "list" { cmds = receipt.commands }
+        const data = escpos(cmds)?
+        return this.write(data)
+    }
+
+    // Resposta da impressora (buffer; vazio se o tempo acabar). Só nos
+    // caminhos usb e serial.
+    read(timeout = 1000, max = 64) {
+        const h = waitLoop(_ms(timeout), (slice) => {
+            const r = this._out.text((b, n) => _fn.fsu_printer_read(this.handle, slice, max, b, n))?
+            if r == "" { return nil, nil }
+            return r, nil
+        })?
+        return fromHex(h ?? ""), nil
+    }
+
+    // Status ESC/POS (DLE EOT): { online, drawer, paper_near_end, paper_out, raw };
+    // nil nos campos que a impressora não respondeu.
+    status(timeout = 1000) {
+        this.write([16, 4, 1])?
+        const a = this.read(timeout, 1)?
+        this.write([16, 4, 4])?
+        const p = this.read(timeout, 1)?
+        const out = { online: nil, drawer: nil, paper_near_end: nil, paper_out: nil, raw: a.hex() + p.hex() }
+        if len(a) > 0 {
+            const s = a.toList()[0]
+            // bit 3 = offline, bit 2 = sensor da gaveta
+            out.online = s % 16 < 8
+            out.drawer = s % 8 >= 4
+        }
+        if len(p) > 0 {
+            const s = p.toList()[0]
+            // bits 2-3 = papel acabando, bits 5-6 = sem papel
+            out.paper_near_end = s % 16 >= 4
+            out.paper_out = s % 128 >= 32
+        }
+        return out, nil
+    }
+
+    // { backend, target, device }
+    info() {
+        return this._out.json((b, n) => _fn.fsu_printer_info(this.handle, b, n))
+    }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _fn.fsu_printer_close(this.handle)
+        this.handle = 0
+        return _status(rc)
+    }
+}
+
+// Abre uma impressora.
+//   selector: "" (primeira impressora USB), id, "vvvv:pppp", nome de uma
+//             impressora instalada no Windows ("printer:EPSON TM-T20" ou só o
+//             nome), porta ("COM3"), "/dev/usb/lp0".
+//   options:  backend ("auto" | "spooler" | "usbprint" | "usb" | "serial" |
+//             "file"), baud, timeout_ms.
+export fn openPrinter(selector = "", options = {}) {
+    load()?
+    const h = _fn.fsu_printer_open(selector, json.stringify(options))
+    if h < 0 { return nil, _last_error() }
+    const p = new Printer(h)
+    const i = p.info()?
+    p.backend = i.backend
+    p.target = i.target
+    return p, nil
+}
+
+// Monta um cupom ESC/POS, encadeando chamadas:
+//   const r = usb.receipt("cp860")
+//   r.center().bold().line("LOJA").bold(false).left().line("Item  R$ 10,00")
+//   r.qr("https://...").feed(3).cut()
+//   printer.print(r)?
+export struct Receipt {
+    commands = []
+
+    new(codepage = "cp860") {
+        this.commands = [{ init: true }, { codepage: codepage }]
+    }
+
+    _add(c) {
+        this.commands.push(c)
+        return this
+    }
+
+    text(t) { return this._add({ text: t }) }
+    line(t = "") { return this._add({ line: t }) }
+    bold(on = true) { return this._add({ bold: on }) }
+    underline(on = true) { return this._add({ underline: on }) }
+    invert(on = true) { return this._add({ invert: on }) }
+    left() { return this._add({ align: "left" }) }
+    center() { return this._add({ align: "center" }) }
+    right() { return this._add({ align: "right" }) }
+    // Tamanho do texto: 1 a 8 vezes (largura, altura; altura 0 = igual à largura).
+    size(width = 1, height = 0) {
+        let h = height
+        if h == 0 { h = width }
+        return this._add({ size: [width, h] })
+    }
+    // QR Code: size 1..16, ec "l" | "m" | "q" | "h".
+    qr(data, size = 6, ec = "m") { return this._add({ qr: data, size: size, ec: ec }) }
+    // type: ean13, ean8, upca, upce, code39, itf, codabar, code93, code128.
+    barcode(data, type = "code128", height = 80, hri = "below") {
+        return this._add({ barcode: data, type: type, height: height, hri: hri })
+    }
+    feed(lines = 1) { return this._add({ feed: lines }) }
+    cut(partial = false) {
+        if partial { return this._add({ cut: "partial" }) }
+        return this._add({ cut: true })
+    }
+    // Abre a gaveta de dinheiro ligada à impressora (pino 2 ou 5).
+    drawer(pin = 2) { return this._add({ drawer: true, pin: pin }) }
+    beep(times = 1) { return this._add({ beep: times }) }
+    raw(data) { return this._add({ raw: hex(data) }) }
+
+    bytes() { return escpos(this.commands) }
+}
+
+// Novo cupom ESC/POS na página de código da impressora.
+export fn receipt(codepage = "cp860") {
+    return new Receipt(codepage)
+}
+
+// ---- biometria (Windows Biometric Framework) ----
+
+// Leitores de digital com driver do Windows (Windows Hello):
+// [{ unit_id, description, manufacturer, model, serial, pool, firmware }]
+export fn fingerprintReaders() {
+    load()?
+    return new _Out(65536).json((b, n) => _fn.fsu_bio_units(b, n))
+}
+
+// Espera um dedo e diz de quem é, pelas digitais cadastradas no Windows
+// Hello: { matched: true, account: "PC\maria", sid, finger: "right_index",
+// unit_id }, { matched: false }, ou nil se o tempo acabar.
+// (A captura biométrica do Windows não pode ser fatiada: esta chamada espera
+// direto na lib, congelando as outras tarefas fg até o dedo ou o timeout.)
+export fn identifyFinger(timeout = 30000) {
+    load()?
+    const ms = _ms(timeout)
+    return new _Out(8192).json((b, n) => _fn.fsu_bio_identify(ms, b, n))
+}
+
+// Captura a imagem da digital (o Windows exige administrador):
+// { width, height, depth, dpi, finger, quality, record (ANSI 381, hex), saved }
+// ou nil. save: caminho .pgm ou .bmp para gravar a imagem.
+export fn captureFinger(timeout = 30000, save = "") {
+    load()?
+    const ms = _ms(timeout)
+    return new _Out(4194304).json((b, n) => _fn.fsu_bio_capture(ms, save, b, n))
+}

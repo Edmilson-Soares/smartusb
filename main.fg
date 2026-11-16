@@ -1,0 +1,61 @@
+// Exemplo: lista o que está conectado na USB, espera um scanner (ou usa o
+// que já estiver) e mostra o que for lido, com o tipo do conteúdo.
+//   fogu run build:native && fogu run usbids && fogu run main.fg
+import usb from "./smartusb.fg"
+import fs from "fogu:fs"
+
+fn showDevice(d) {
+    print(`  ${d.id}  ${d.vid}:${d.pid}  ${d.category}: ${d.name}`)
+    if len(d.modes) > 0 { print(`      leitura: ${d.modes.join(", ")}`) }
+    for p in d.ports { print(`      porta: ${p}`) }
+    for r in d.readers { print(`      leitor PC/SC: ${r}`) }
+}
+
+fn showScan(r) {
+    let sym = ""
+    if r.symbology != nil { sym = ` [${r.symbology}]` }
+    print(`lido${sym}: ${r.text}`)
+    const c = r.content
+    if c.type == "pix" { print(`  PIX: ${c.merchant}, valor ${c.amount ?? "aberto"}, chave ${c.key ?? c.url}, válido ${c.valid}`) }
+    else if c.type == "nfe_key" { print(`  chave ${c.model}: UF ${c.uf}, CNPJ ${c.cnpj}, número ${c.number}`) }
+    else if c.type == "nfce" { print(`  NFC-e, chave ${c.key} (válida: ${c.valid})`) }
+    else if c.type == "url" { print(`  URL: ${c.url}`) }
+    else if c.get("valid") != nil { print(`  ${c.type} (dígito verificador ok: ${c.valid})`) }
+    else { print(`  ${c.type}`) }
+}
+
+fn main() {
+    print(`fogusmartusb ${usb.version()?}`)
+    if fs.exists("devices.json") { usb.loadIds("devices.json")? }
+    if fs.exists("data/usb.ids") { print(`usb.ids: ${usb.loadIds("data/usb.ids")?} nomes`) }
+
+    print("aparelhos USB:")
+    for d in usb.devices()? { showDevice(d) }
+
+    const w = usb.watch()?
+    print("procurando um scanner (conecte um; 30s)...")
+    const dev = w.waitFor(usb.SCANNER_KINDS, 30s)?
+    w.close()?
+
+    let s = nil
+    if dev != nil {
+        print(`scanner: ${dev.name} (${dev.modes.join(", ")})`)
+        s = usb.openScanner(dev.id)?
+    } else {
+        // Scanners baratos aparecem como "USB Keyboard": escuta todos os
+        // teclados e aceita só rajadas rápidas (digitação humana é ignorada).
+        print("nenhum scanner reconhecido; lendo de qualquer teclado (só rajadas de scanner)")
+        s = usb.openScanner("keyboard")?
+    }
+    print(`modo ${s.mode}; leia códigos (60s sem leitura encerra)`)
+    while true {
+        const r = s.read(60s)?
+        if r == nil { break }
+        showScan(r)
+    }
+    s.close()?
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil { print(`erro: ${err.message}`) }

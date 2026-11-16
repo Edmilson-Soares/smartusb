@@ -1,0 +1,40 @@
+[package]
+name = "fogusmartusb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# HID: no Windows usa a implementação nativa em Rust (sem compilador C);
+# no Linux, hidraw (precisa do libudev-dev).
+hidapi = { version = "2", default-features = false, features = ["windows-native", "linux-static-hidraw"] }
+# Enumeração USB em Rust puro (SetupAPI / sysfs / IOKit).
+nusb = { version = "0.2", default-features = false }
+pcsc = "2"
+serde_json = "1"
+serialport = { version = "4", default-features = false, features = ["usbportinfo-interface"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Informações USB (VID/PID/serial) das portas seriais no Linux.
+serialport = { version = "4", default-features = false, features = ["libudev", "usbportinfo-interface"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_BiometricFramework",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
+    "Win32_Security",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

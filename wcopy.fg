@@ -1,0 +1,530 @@
+// wcopy.fg — leitor NFC "wCopy Smart Reader" (NSCCN / rfcardwriter, USB
+// 0416:b030) para Fogu, pelo HID genérico do smartusb.fg.
+//
+// Esse leitor barato não tem PC/SC nem CCID: é um aparelho HID (interface 0;
+// a interface 1 é um disco USB com o instalador do programa do fabricante)
+// com um chip PN532 dentro, falando o conjunto de comandos do PN532
+// (TFI D4 host->chip, D5 chip->host) numa moldura própria de 64 bytes.
+// Protocolo de engenharia reversa (github.com/wrcrooks/wcopy-nfc, MIT),
+// conferido aqui com o aparelho de verdade.
+//
+//   host -> leitor (relatório de saída, 64 bytes):
+//     01 LEN seq(2, little-endian) FF 00 00 00 PNLEN corpo... CK FE 00...
+//     LEN = bytes significativos (até o FE, inclusive); PNLEN = len(corpo);
+//     CK: (soma de LEN até o último byte do corpo) + CK == FE (mod 256)
+//   leitor -> host (relatório de entrada, 64 bytes):
+//     02 LEN seq(2) corpo... CK FD 00...   (corpo começa logo no byte 4)
+//     CK: (soma de LEN até o último byte do corpo) + CK == FD (mod 256)
+//
+// Cartões: MIFARE Classic (SAK 08/18/09: autenticação por setor e blocos de
+// 16 bytes) e Ultralight/NTAG (SAK 00: páginas de 4 bytes, sem chaves). O
+// Card tem os mesmos métodos do scard.Card do smartcard (uid, readBlock,
+// writeBlock, readPages, writePages, auth), então módulos escritos para um
+// servem para o outro (ex.: smartcard/examples/registro.fg).
+import usb from "./smartusb.fg"
+import { ms as _ms } from "./_native.fg"
+import time from "fogu:time"
+
+export const VID_PID = "0416:b030"
+
+// Chave que o programa do fabricante (e o driver wcopy-nfc) deixa nos
+// trailers dos setores que grava.
+export const KEY_WCOPY = "D3F7D3F7D3F7"
+
+// Chaves tentadas, nesta ordem, quando readBlock/writeBlock recebem key = ""
+// (a mesma lista do programa do fabricante).
+export const KNOWN_KEYS = [
+    KEY_WCOPY,
+    "FFFFFFFFFFFF",   // padrão de fábrica do MIFARE Classic
+    "A0A1A2A3A4A5",   // NXP AN10787 (MAD/NDEF)
+    "000000000000",
+    "B0B1B2B3B4B5",
+    "4D3A99C351DD",
+    "1A982C7E459A",
+    "AABBCCDDEEFF",
+]
+
+const OUT_MARKER = 0x01
+const IN_MARKER = 0x02
+const OUT_TERMINATOR = 0xFE
+const IN_TERMINATOR = 0xFD
+const REPORT_SIZE = 64
+
+const TFI_OUT = 0xD4
+const TFI_IN = 0xD5
+const CMD_FIRMWARE = 0x02
+const CMD_INLIST = 0x4A
+const CMD_EXCHANGE = 0x40
+const TAG_AUTH_A = 0x60
+const TAG_AUTH_B = 0x61
+const TAG_READ = 0x30
+const TAG_WRITE16 = 0xA0   // Classic: o firmware grava os 16 bytes inteiros
+const TAG_WRITE4 = 0xA2    // Ultralight/NTAG: uma página
+
+// Nomes dos status do PN532 que mais aparecem.
+const STATUS = {
+    "1": "tempo esgotado (cartão não respondeu)",
+    "2": "erro de CRC",
+    "3": "erro de paridade",
+    "5": "framing",
+    "6": "colisão",
+    "7": "buffer insuficiente",
+    "9": "RF buffer overflow",
+    "10": "campo RF desligado",
+    "11": "protocolo RF",
+    "13": "temperatura",
+    "14": "overflow interno",
+    "16": "parâmetro inválido",
+    "18": "comando não suportado pelo cartão",
+    "19": "formato inválido",
+    "20": "autenticação recusada (chave errada ou sessão perdida)",
+    "35": "UID inválido",
+    "37": "modo inválido",
+    "41": "cartão foi embora",
+    "42": "cartão não corresponde",
+    "43": "cartão desapareceu",
+}
+
+fn _bytes(value) {
+    const t = typeof(value)
+    if t == "list" { return value }
+    if t == "str" {
+        if value == "" { return [] }
+        return bytes(value, "hex").toList()
+    }
+    return value.toList()
+}
+
+fn _hexUpper(list) { return bytes(list).hex().upper() }
+
+fn _statusText(code) {
+    const name = STATUS.get(str(code))
+    const h = bytes([code]).hex()
+    if name == nil { return `status 0x${h}` }
+    return `${name} (status 0x${h})`
+}
+
+// Monta um relatório de saída (lista de 64 bytes) para o corpo PN532
+// (TFI + comando + dados), com o contador seq.
+export fn frame(body, seq = 0) {
+    const out = [OUT_MARKER, 0, seq & 0xFF, seq >> 8 & 0xFF, 0xFF, 0, 0, 0, len(body)]
+    for b in body { out.push(b) }
+    out[1] = len(out) + 2
+    let sum = 0
+    for i in 1..len(out) { sum += out[i] }
+    out.push((OUT_TERMINATOR - sum) & 0xFF)
+    out.push(OUT_TERMINATOR)
+    while len(out) < REPORT_SIZE { out.push(0) }
+    return out
+}
+
+// Extrai o corpo PN532 (TFI D5 + comando + dados) de um relatório de
+// entrada, conferindo marcador, tamanho, checksum e terminador.
+// Devolve nil para relatórios de outro tipo (o leitor manda tráfego
+// periódico pelo mesmo canal) ou corrompidos. O firmware do leitor
+// acrescenta "90 00" ao fim do corpo (observado no aparelho real); quem
+// usa o corpo lê só os bytes que o comando define e ignora o resto.
+export fn parse(report) {
+    const r = _bytes(report)
+    if len(r) < 6 || r[0] != IN_MARKER { return nil }
+    const total = r[1]
+    if total < 6 || total > len(r) { return nil }
+    if r[total - 1] != IN_TERMINATOR { return nil }
+    let sum = 0
+    for i in 1..(total - 1) { sum += r[i] }
+    if (sum & 0xFF) != IN_TERMINATOR { return nil }
+    const body = r.slice(4, total - 2)
+    if len(body) == 0 || body[0] != TFI_IN { return nil }
+    return body
+}
+
+// Setor de um bloco MIFARE Classic (1K/Mini: 4 blocos; 4K: 16 a partir do 128).
+export fn sectorOf(block) {
+    if block < 128 { return int(block / 4) }
+    return 32 + int((block - 128) / 16)
+}
+
+export fn isTrailer(block) {
+    if block < 128 { return block % 4 == 3 }
+    return (block - 128) % 16 == 15
+}
+
+// Tipo e família pelo SAK (SEL_RES), nos mesmos nomes do smartcard.
+export fn kindOf(sak) {
+    if sak == 0x00 { return "mifare_ultralight", "mifare_ultralight" }
+    if sak == 0x08 { return "mifare_classic_1k", "mifare_classic" }
+    if sak == 0x18 { return "mifare_classic_4k", "mifare_classic" }
+    if sak == 0x09 { return "mifare_mini", "mifare_classic" }
+    if sak == 0x20 { return "iso14443_4", "iso14443_4" }
+    if sak == 0x28 { return "iso14443_4", "iso14443_4" }   // Classic com ISO 14443-4 (Plus / emulação)
+    return "unknown", "unknown"
+}
+
+export struct Reader {
+    hid = nil
+    seq = 0
+    fw = nil         // { ic, version, revision, support } depois de open()
+
+    new(hid) {
+        this.hid = hid
+    }
+
+    _send(body) {
+        this.seq = (this.seq + 1) % 65536
+        // número de relatório 0 na frente: o aparelho não numera relatórios
+        this.hid.write([0].concat(frame(body, this.seq)))?
+        return true, nil
+    }
+
+    // Espera a resposta ao comando cmd (D5, cmd+1), pulando os relatórios
+    // de outro tipo. nil se o tempo acabar.
+    _recv(cmd, timeout = 2000) {
+        for i in 0..40 {
+            const r = this.hid.read(timeout)?
+            if r == nil { return nil, nil }
+            const body = parse(r)
+            if body != nil && len(body) >= 2 && body[1] == cmd + 1 { return body, nil }
+        }
+        return nil, nil
+    }
+
+    // Envia um comando PN532 (lista: comando + dados, sem o TFI) e devolve a
+    // resposta (lista, sem TFI nem código: só os dados).
+    command(cmd, data = [], timeout = 2000) {
+        // descarta o que ficou pendente de antes
+        while true {
+            const old = this.hid.read(0)?
+            if old == nil { break }
+        }
+        this._send([TFI_OUT, cmd].concat(_bytes(data)))?
+        const body = this._recv(cmd, timeout)?
+        if body == nil { return nil, error("o leitor wCopy não respondeu") }
+        return body.slice(2), nil
+    }
+
+    // { ic, version, revision, support }: ic 0x32 = PN532.
+    firmware() {
+        const r = this.command(CMD_FIRMWARE)?
+        if len(r) < 4 { return nil, error("resposta curta ao GetFirmwareVersion") }
+        return { ic: r[0], version: `${r[1]}.${r[2]}`, revision: r[2], support: r[3] }, nil
+    }
+
+    // InDataExchange com o cartão selecionado: devolve os dados da resposta
+    // do cartão (lista) ou erro com o status do PN532.
+    exchange(tagCmd, timeout = 2000) {
+        const r = this.command(CMD_EXCHANGE, [1].concat(_bytes(tagCmd)), timeout)?
+        if len(r) < 1 { return nil, error("resposta vazia ao InDataExchange") }
+        if r[0] != 0 { return nil, error(`comando do cartão falhou: ${_statusText(r[0])}`) }
+        return r.slice(1), nil
+    }
+
+    // Procura um cartão ISO 14443-A (uma leitura do campo). Devolve o Card
+    // ou nil se não há cartão no leitor.
+    _inlist() {
+        this._send([TFI_OUT, CMD_INLIST, 1, 0])?
+        const body = this._recv(CMD_INLIST, 500)?
+        if body == nil || len(body) < 3 { return nil, nil }
+        const nb = body[2]
+        if nb == 0 || len(body) < 8 { return nil, nil }
+        // body: D5 4B Nb Tg SENS_RES(2) SEL_RES NFCIDLen NFCID...
+        const uidLen = body[7]
+        if len(body) < 8 + uidLen { return nil, nil }
+        const atqa = body.slice(4, 6)
+        const sak = body[6]
+        const uid = body.slice(8, 8 + uidLen)
+        return new Card(this, uid, atqa, sak), nil
+    }
+
+    // Espera um cartão aproximar (timeout: duração ou ms; -1 = sem limite).
+    // Devolve o Card, ou nil se o tempo acabar.
+    poll(timeout = 3000) {
+        const ms = _ms(timeout)
+        const t0 = time.monotonic()
+        while true {
+            const card = this._inlist()?
+            if card != nil { return card, nil }
+            if ms >= 0 && (time.monotonic() - t0) * 1000 >= ms { return nil, nil }
+            time.delay(100ms)
+        }
+        return nil, nil
+    }
+
+    // Espera o cartão atual sair do leitor (timeout igual ao poll).
+    waitRemoved(uidHex, timeout = -1) {
+        const ms = _ms(timeout)
+        const t0 = time.monotonic()
+        while true {
+            const card = this._inlist()?
+            if card == nil || card.uidHex != uidHex { return true, nil }
+            if ms >= 0 && (time.monotonic() - t0) * 1000 >= ms { return false, nil }
+            time.delay(200ms)
+        }
+        return false, nil
+    }
+
+    close() {
+        if this.hid == nil { return true, nil }
+        const r = this.hid.close()
+        this.hid = nil
+        return r
+    }
+}
+
+// Um cartão no campo do leitor. Mesma API do scard.Card para cartões de
+// memória: uid(), readBlock, writeBlock, readSector, readPages, writePages,
+// auth, read/write. key = "" tenta as KNOWN_KEYS.
+export struct Card {
+    reader = nil
+    uidList = []
+    uidHex = ""
+    atqa = []
+    sak = 0
+    kind = ""
+    family = ""
+    protocol = "iso14443a"
+    _sector = -1     // setor autenticado na sessão atual (-1 = nenhum)
+    _key = ""        // chave que abriu o setor atual (hex)
+    _keyB = false
+
+    new(reader, uid, atqa, sak) {
+        this.reader = reader
+        this.uidList = uid
+        this.uidHex = _hexUpper(uid)
+        this.atqa = atqa
+        this.sak = sak
+        const [kind, family] = kindOf(sak)
+        this.kind = kind
+        this.family = family
+    }
+
+    uid() { return this.uidHex, nil }
+
+    // Chave (hex) que abriu o setor atual, "" se nenhum setor está autenticado.
+    key() { return this._key }
+
+    // Nome legível do tipo.
+    name() {
+        const names = {
+            mifare_ultralight: "MIFARE Ultralight / NTAG",
+            mifare_classic_1k: "MIFARE Classic 1K",
+            mifare_classic_4k: "MIFARE Classic 4K",
+            mifare_mini: "MIFARE Mini",
+            iso14443_4: "Cartão ISO 14443-4 (DESFire, pagamento, documento...)",
+        }
+        return names.get(this.kind, `ISO 14443-A (SAK 0x${bytes([this.sak]).hex()})`)
+    }
+
+    // Seleciona o cartão de novo (a sessão RF cai depois de autenticações
+    // falhadas). Erro se o cartão saiu ou se outro respondeu.
+    reselect() {
+        const c = this.reader.poll(3000)?
+        if c == nil { return nil, error("o cartão saiu do leitor") }
+        if c.uidHex != this.uidHex {
+            return nil, error(`outro cartão respondeu (UID ${c.uidHex}, esperava ${this.uidHex})`)
+        }
+        this._sector = -1
+        return true, nil
+    }
+
+    // Autentica o setor do bloco (MIFARE Classic). key em hex ("" = tenta as
+    // KNOWN_KEYS, na ordem); keyB usa a chave B. Devolve a chave que abriu.
+    auth(block, key = "", keyB = false) {
+        if this.family != "mifare_classic" {
+            return nil, error(`${this.name()} não usa autenticação MIFARE Classic`)
+        }
+        let keys = KNOWN_KEYS
+        if key != "" { keys = [_hexUpper(_bytes(key))] }
+        let cmd = TAG_AUTH_A
+        if keyB { cmd = TAG_AUTH_B }
+        let first = true
+        let last = nil
+        for k in keys {
+            // uma autenticação falhada derruba a sessão: seleciona de novo
+            if !first { this.reselect()? }
+            first = false
+            const [_r, err] = this.reader.exchange([cmd, block].concat(_bytes(k)).concat(this.uidList))
+            if err == nil {
+                this._sector = sectorOf(block)
+                this._key = k
+                this._keyB = keyB
+                return k, nil
+            }
+            last = err
+        }
+        let why = ""
+        if last != nil { why = `: ${last.message}` }
+        return nil, error(`não autenticou o setor ${sectorOf(block)} com ${len(keys)} chave(s)${why}`)
+    }
+
+    _ensureAuth(block, key, keyB) {
+        if this.family != "mifare_classic" { return true, nil }
+        const s = sectorOf(block)
+        if this._sector == s && (key == "" || _hexUpper(_bytes(key)) == this._key) && keyB == this._keyB { return true, nil }
+        if this._sector != -1 { this.reselect()? }
+        this.auth(block, key, keyB)?
+        return true, nil
+    }
+
+    // Lê 16 bytes (um bloco Classic, ou 4 páginas Ultralight a partir de addr).
+    read(addr, length = 16) {
+        const [data, err] = this.reader.exchange([TAG_READ, addr])
+        if err == nil { return bytes(data.slice(0, length)), nil }
+        return nil, err
+    }
+
+    // Grava 16 bytes num bloco Classic ou 4 bytes numa página Ultralight,
+    // sem as proteções (use writeBlock/writePages).
+    write(addr, data) {
+        const d = _bytes(data)
+        if this.family == "mifare_ultralight" {
+            if len(d) != 4 { return nil, error(`página Ultralight tem 4 bytes, recebi ${len(d)}`) }
+            this.reader.exchange([TAG_WRITE4, addr].concat(d))?
+            return true, nil
+        }
+        if len(d) != 16 { return nil, error(`bloco tem 16 bytes, recebi ${len(d)}`) }
+        this.reader.exchange([TAG_WRITE16, addr].concat(d))?
+        return true, nil
+    }
+
+    // Autentica e lê um bloco MIFARE Classic (buffer de 16 bytes). Se a
+    // sessão RF caiu no meio, seleciona e autentica de novo uma vez.
+    readBlock(block, key = "", keyB = false) {
+        this._ensureAuth(block, key, keyB)?
+        const [data, err] = this.read(block, 16)
+        if err == nil { return data, nil }
+        this.reselect()?
+        this.auth(block, key, keyB)?
+        return this.read(block, 16)
+    }
+
+    // Autentica e grava um bloco MIFARE Classic (16 bytes). O bloco 0
+    // (fabricante/UID) e os trailers (chaves e bits de acesso) exigem unsafe.
+    writeBlock(block, data, key = "", keyB = false, unsafe = false) {
+        const d = _bytes(data)
+        if len(d) != 16 { return nil, error(`bloco tem 16 bytes, recebi ${len(d)}`) }
+        if block == 0 && !unsafe { return nil, error("o bloco 0 é do fabricante (UID); passe unsafe para gravar") }
+        if isTrailer(block) {
+            if !unsafe { return nil, error(`o bloco ${block} é o trailer do setor (chaves e bits de acesso); passe unsafe para gravar`) }
+            if !accessBitsValid(d) { return nil, error(`trailer ${block} recusado: bits de acesso inconsistentes travariam o setor para sempre`) }
+        }
+        this._ensureAuth(block, key, keyB)?
+        const [_ok, err] = this.write(block, d)
+        if err == nil { return true, nil }
+        this.reselect()?
+        this.auth(block, key, keyB)?
+        return this.write(block, d)
+    }
+
+    // Todos os blocos de um setor (lista de buffers), inclusive o trailer.
+    readSector(sector, key = "", keyB = false) {
+        let first = sector * 4
+        let count = 4
+        if sector >= 32 {
+            first = 128 + (sector - 32) * 16
+            count = 16
+        }
+        const out = []
+        for i in 0..count { out.push(this.readBlock(first + i, key, keyB)?) }
+        return out, nil
+    }
+
+    // Ultralight/NTAG: count páginas (4 bytes cada) a partir de page.
+    readPages(page, count = 4) {
+        const data = []
+        let p = page
+        while len(data) < count * 4 {
+            const chunk = this.read(p, 16)?
+            for b in chunk.toList() { data.push(b) }
+            p += 4
+        }
+        return bytes(data.slice(0, count * 4)), nil
+    }
+
+    // Ultralight/NTAG: grava data (múltiplo de 4 bytes) a partir de page.
+    // As páginas 0..3 (UID, lock, OTP/CC: irreversíveis) exigem unsafe.
+    writePages(page, data, unsafe = false) {
+        const d = _bytes(data)
+        if len(d) % 4 != 0 { return nil, error(`Ultralight grava páginas de 4 bytes, recebi ${len(d)}`) }
+        if page < 4 && !unsafe { return nil, error(`a página ${page} tem UID/lock/OTP (irreversível); passe unsafe para gravar`) }
+        for i in 0..int(len(d) / 4) {
+            this.write(page + i, d.slice(i * 4, i * 4 + 4))?
+        }
+        return true, nil
+    }
+
+    // Lê o cartão inteiro (Classic: setores; Ultralight: páginas 0..15).
+    dump(key = "", keyB = false) {
+        if this.family == "mifare_ultralight" {
+            return [{ pages: this.readPages(0, 16)? }], nil
+        }
+        let sectors = 16
+        if this.kind == "mifare_classic_4k" { sectors = 40 }
+        if this.kind == "mifare_mini" { sectors = 5 }
+        const out = []
+        for s in 0..sectors {
+            const [blocks, err] = this.readSector(s, key, keyB)
+            if err != nil { out.push({ sector: s, error: err.message }) } else { out.push({ sector: s, blocks: blocks, key: this._key }) }
+        }
+        return out, nil
+    }
+
+    close() { return true, nil }
+}
+
+// Bits de acesso de um trailer (bytes 6..8) são redundantes: cada bit
+// C1/C2/C3 aparece também invertido. Um trailer inconsistente trava o setor.
+export fn accessBitsValid(trailer) {
+    const t = _bytes(trailer)
+    if len(t) != 16 { return false }
+    const b6 = t[6]
+    const b7 = t[7]
+    const b8 = t[8]
+    // b6 = ~C2 (alto) | ~C1 (baixo); b7 = C1 (alto) | ~C3 (baixo); b8 = C3 (alto) | C2 (baixo)
+    const c1 = int(b7 / 16)
+    const c2 = b8 % 16
+    const c3 = int(b8 / 16)
+    return int(b6 / 16) == 15 - c2 && b6 % 16 == 15 - c1 && b7 % 16 == 15 - c3
+}
+
+// Abre o leitor wCopy (o primeiro, ou o seletor do smartusb: id, "vvvv:pppp"
+// ou caminho HID). Confere a conversa com um GetFirmwareVersion.
+export fn open(selector = VID_PID) {
+    const hid = usb.openHid(selector, { interface: 0 })?
+    const r = new Reader(hid)
+    const [fw, err] = r.firmware()
+    if err != nil {
+        r.close()
+        return nil, error(`leitor wCopy não respondeu (${err.message}); é mesmo um wCopy/NSCCN (0416:b030)?`)
+    }
+    r.fw = fw
+    return r, nil
+}
+
+// Um Reader sobre qualquer objeto com write(data)/read(timeout)/close() de
+// relatórios HID (um usb.Hid, ou um simulado nos testes). Não confere o firmware.
+export fn fromHid(hid) {
+    return new Reader(hid)
+}
+
+// Há um leitor wCopy conectado? Devolve o aparelho do smartusb ou nil.
+export fn find() {
+    for d in usb.devices()? {
+        if d.vid == "0416" && d.pid == "b030" { return d, nil }
+    }
+    return nil, nil
+}
+
+// Atalho: abre o leitor, espera um cartão e devolve [reader, card].
+export fn waitForCard(timeout = -1) {
+    const r = open()?
+    const [card, err] = r.poll(timeout)
+    if err != nil {
+        r.close()
+        return nil, err
+    }
+    if card == nil {
+        r.close()
+        return nil, nil
+    }
+    return [r, card], nil
+}
