@@ -1,6 +1,13 @@
 // _native.fg — carrega a parte nativa (cdylib Rust) de uma lib Fogu e
-// conversa com ela pelo fogu:ffi, usando os callbacks do Fogu 0.7+ (testado com o 0.7.4).
+// conversa com ela pelo fogu:ffi. Requer o Fogu 0.8.0 ou mais novo (MIN_FOGU).
 // O mesmo arquivo é usado por todas as libs deste repositório.
+//
+// Instalação: os binários de cada plataforma vão no próprio repositório git
+// (native/<so>-<arch>/), então `fogu add user/repo` já instala a lib pronta
+// para uso — sem Rust/cargo na máquina de quem instala:
+//   native/windows-x64/<nome>.dll
+//   native/linux-x64/lib<nome>.so      native/linux-arm64/lib<nome>.so
+//   native/macos-x64/lib<nome>.dylib   native/macos-arm64/lib<nome>.dylib
 //
 //   const native = new Native("sshserver", "fogussh", "fssh", SIGNATURES, "FOGU_SSH_LIB")
 //   native.load()?                 // procura e abre a lib (uma vez)
@@ -19,7 +26,7 @@
 // Esperas longas são feitas em fatias (SLICE_MS) cedendo a vez entre elas:
 // uma chamada FFI bloqueante congela todas as tarefas fg.
 //
-// Fogu 0.7.4: o código compilado (JIT) chama direto as funções FFI de
+// Fogu 0.7.4+: o código compilado (JIT) chama direto as funções FFI de
 // assinatura numérica (ints, ptr como int, f64, bool) — sem alocação nem
 // busca de nome por chamada —, então os laços de *_status/*_poll são baratos;
 // os nomes de tipo do Go (int32, uint8, float64...) também valem nas
@@ -34,6 +41,29 @@ import time from "fogu:time"
 // Quanto uma espera nativa pode bloquear antes de devolver a vez às tarefas fg
 // (o mesmo valor do pacote oficial `hardware`).
 export const SLICE_MS = 10
+
+// Versão mínima do Fogu para as libs deste repositório.
+export const MIN_FOGU = "0.8.0"
+
+fn _ver(v) {
+    const out = []
+    for p in str(v ?? "0").split("-")[0].split(".") {
+        const [n, _e] = int(p)
+        out.push(n ?? 0)
+    }
+    while len(out) < 3 { out.push(0) }
+    return out
+}
+
+// true se a versão do Fogu em execução é >= min.
+export fn fogu_ok(min = MIN_FOGU) {
+    const a = _ver(Fogu.version)
+    const b = _ver(min)
+    for i in 0..3 {
+        if a[i] != b[i] { return a[i] > b[i] }
+    }
+    return true
+}
 
 let _coop = true
 
@@ -203,6 +233,9 @@ export struct Native {
     // Abre a lib (uma vez), declara as funções e registra o sink.
     load(explicit = nil) {
         if this.path != nil { return true, nil }
+        if !fogu_ok() {
+            return nil, error(`${this.pkg}: requer o Fogu ${MIN_FOGU} ou mais novo (este é o ${Fogu.version ?? "?"}); atualize o Fogu`)
+        }
         if this.oses != nil && !this.oses.contains(system.info.os) {
             return nil, error(`${this.pkg}: não funciona em ${platform()} (sistemas suportados: ${this.oses.join(", ")})`)
         }

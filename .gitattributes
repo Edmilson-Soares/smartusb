@@ -1,0 +1,5 @@
+# binários nativos (dll/so/dylib) vão no repositório: sem conversão de fim de linha nem diff
+native/** binary
+*.dll binary
+*.so binary
+*.dylib binary

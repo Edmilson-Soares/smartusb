@@ -1,6 +1,7 @@
 {
   "name": "smartusb",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "engines": { "fogu": ">=0.8.0" },
   "entry": "main.fg",
   "scripts": {
     "start": "fogu run main.fg",

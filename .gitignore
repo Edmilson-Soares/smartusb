@@ -13,7 +13,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# fogusmartusb (lib Rust), biblioteca gerada e usb.ids baixado (fogu run usbids)
+# fogusmartusb (lib Rust), usb.ids baixado (fogu run usbids)
 fogusmartusb/target/
-native/
 data/
